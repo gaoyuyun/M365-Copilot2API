@@ -68,12 +68,18 @@ func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, sen
 			}
 		}
 		if sendUsage {
-			usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": nil}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
+			usage, upstream := openAIUsage(res, int64(pt), int64(ct))
+			usageChunk := base(map[string]any{}, nil)
+			usageChunk["usage"] = usage
+			if upstream {
+				usageChunk["m365_usage_source"] = "upstream_chathub"
+			}
 			_ = sseSafeRaw(w, flusher, "data: "+mustJSON(usageChunk)+"\n\n")
 		}
 		_ = sseSafeRaw(w, flusher, "data: [DONE]\n\n")
 		return nil
 	}
-	jsonOut(w, map[string]any{"id": id, "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": "tool_calls"}}, "m365": compatM365Metadata(res), "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}})
+	usage, _ := openAIUsage(res, int64(pt), int64(ct))
+	jsonOut(w, map[string]any{"id": id, "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": "tool_calls"}}, "m365": compatM365Metadata(res), "usage": usage})
 	return nil
 }

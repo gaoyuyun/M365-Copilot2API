@@ -179,38 +179,38 @@ type Account struct {
 }
 
 type Request struct {
-	Text           string
-	Tone           string
-	ConversationID string
-	SessionID      string
-	Attachments    []Attachment
-	Tools          []Tool
-	ToolChoice     any
-	MCPServerURL   string
-	Started        bool
-	ConversationSignature   string
-	PreviousMessages        []ContextMessage
-	LicenseType             string
-	Scenario                string
-	ConnectedFederatedIDs   []string
-	FeatureFlags            FeatureFlags
-	DisableMemory           bool
-	Locale                  string
-	Market                  string
-	TimeZone                string
-	TimeZoneOffset          int
-	DeviceOS                string
+	Text                  string
+	Tone                  string
+	ConversationID        string
+	SessionID             string
+	Attachments           []Attachment
+	Tools                 []Tool
+	ToolChoice            any
+	MCPServerURL          string
+	Started               bool
+	ConversationSignature string
+	PreviousMessages      []ContextMessage
+	LicenseType           string
+	Scenario              string
+	ConnectedFederatedIDs []string
+	FeatureFlags          FeatureFlags
+	DisableMemory         bool
+	Locale                string
+	Market                string
+	TimeZone              string
+	TimeZoneOffset        int
+	DeviceOS              string
 }
 
 type FeatureFlags struct {
-	MemoryV2            bool
-	DeepWork            bool
-	ComputerUse         bool
-	RealtimeVoice       bool
+	MemoryV2             bool
+	DeepWork             bool
+	ComputerUse          bool
+	RealtimeVoice        bool
 	SystemPromptOverride bool
-	DesignerImageGen4o  bool
-	CodeCanvas          bool
-	SydneyReconnect     bool
+	DesignerImageGen4o   bool
+	CodeCanvas           bool
+	SydneyReconnect      bool
 }
 
 type ContextMessage struct {
@@ -236,10 +236,10 @@ type StreamEvent struct {
 type StreamHandler func(StreamEvent) error
 
 type Timestamps struct {
-	RequestSent                string `json:"requestSent"`
+	RequestSent                  string `json:"requestSent"`
 	FirstServiceResponseReceived string `json:"firstServiceResponseReceived,omitempty"`
-	FirstTokenReceived         string `json:"firstTokenReceived,omitempty"`
-	LastTokenReceived          string `json:"lastTokenReceived,omitempty"`
+	FirstTokenReceived           string `json:"firstTokenReceived,omitempty"`
+	LastTokenReceived            string `json:"lastTokenReceived,omitempty"`
 }
 
 type Result struct {
@@ -262,6 +262,7 @@ type Result struct {
 	StorageMessageID          string
 	References                map[string]Reference
 	Timestamps                Timestamps
+	Usage                     Usage
 }
 
 type SuggestedResponse struct {
@@ -625,6 +626,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var storageMessageID string
 	references := make(map[string]Reference)
 	var firstServiceResponse bool
+	var usage Usage
 
 	deadline := time.Now().Add(5 * time.Minute)
 	type wsRead struct {
@@ -719,6 +721,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 1 && target == "update" {
+				usage = mergeUsage(usage, usageFromRaw(obj))
 				args, _ := obj["arguments"].([]any)
 				for _, raw := range args {
 					arg, ok := raw.(map[string]any)
@@ -877,6 +880,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 2 {
+				usage = mergeUsage(usage, usageFromRaw(obj))
 				item, _ := obj["item"].(map[string]any)
 				if item != nil {
 					if smid, ok := item["storageMessageId"].(string); ok && smid != "" {
@@ -897,21 +901,21 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					}
 					if res, ok := item["result"].(map[string]any); ok {
 						rawResult, _ = res["value"].(string)
-				if msg, ok := res["message"].(string); ok {
-						final = msg
-						if imageLimitDetected(final) {
-							returnConn = false
-							return Result{}, ErrImageLimit
+						if msg, ok := res["message"].(string); ok {
+							final = msg
+							if imageLimitDetected(final) {
+								returnConn = false
+								return Result{}, ErrImageLimit
+							}
+							if rateLimited(final) {
+								returnConn = false
+								return Result{}, ErrRateLimitNotice
+							}
+							if IsContentPolicyBlock(final) {
+								returnConn = false
+								return Result{}, ErrOffensiveContent
+							}
 						}
-						if rateLimited(final) {
-							returnConn = false
-							return Result{}, ErrRateLimitNotice
-						}
-						if IsContentPolicyBlock(final) {
-							returnConn = false
-							return Result{}, ErrOffensiveContent
-						}
-					}
 					}
 				}
 				// completion frame often follows; keep reading a bit but we already have content
@@ -919,6 +923,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 3 {
+				usage = mergeUsage(usage, usageFromRaw(obj))
 				if errObj, ok := obj["error"].(map[string]any); ok {
 					returnConn = false
 					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
@@ -982,6 +987,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					Normalized:                NormalizeEvents(events),
 					Images:                    imageURLs(events),
 					Timestamps:                ts,
+					Usage:                     usage,
 				}
 				if c.Pool != nil {
 					go func() {
@@ -1271,12 +1277,12 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 			"timeZoneOffset": tzOffset,
 			"timeZone":       tz,
 		},
-		"locale":            locale,
-		"market":            market,
-		"messageType":       "Chat",
-		"experienceType":    "Default",
-		"adaptiveCards":     []any{},
-		"clientPreferences": map[string]any{},
+		"locale":                        locale,
+		"market":                        market,
+		"messageType":                   "Chat",
+		"experienceType":                "Default",
+		"adaptiveCards":                 []any{},
+		"clientPreferences":             map[string]any{},
 		"connectedFederatedConnections": fcAny,
 	}
 	// The browser does not send an OpenAI attachments array to ChatHub. It
