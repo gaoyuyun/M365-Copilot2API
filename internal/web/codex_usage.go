@@ -113,7 +113,11 @@ func estimateResponsesUsage(model string, input []oaiMsg, tools []chathub.Tool, 
 	if output != "" {
 		out += outputProtocolTokens
 	}
-	return responsesUsageEstimate{Values: map[string]any{"input_tokens": in, "output_tokens": out, "total_tokens": in + out}, Source: source}
+	return responsesUsageEstimate{Values: map[string]any{
+		"input_tokens": in, "output_tokens": out, "total_tokens": in + out,
+		"input_tokens_details":        map[string]any{"cached_tokens": int64(0)},
+		"cache_creation_input_tokens": int64(0), "cache_read_input_tokens": int64(0),
+	}, Source: source}
 }
 
 func localUsageMetadata(source string) map[string]any {

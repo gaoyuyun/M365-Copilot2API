@@ -125,11 +125,11 @@ func (s *Server) clientForProxy(proxyURL string) *chathub.Client {
 		return s.chat
 	}
 	c := &chathub.Client{
-		HTTPHeader:  make(http.Header),
-		HTTPClient:  clients.HTTP,
-		Dialer:      clients.WebSocket,
-		Pool:        chathub.NewConnPool(clients.WebSocket, make(http.Header)),
-		Trace:       s.chat.Trace,
+		HTTPHeader: make(http.Header),
+		HTTPClient: clients.HTTP,
+		Dialer:     clients.WebSocket,
+		Pool:       chathub.NewConnPool(clients.WebSocket, make(http.Header)),
+		Trace:      s.chat.Trace,
 	}
 	c.HTTPHeader.Set("Origin", "https://m365.cloud.microsoft")
 	c.HTTPHeader.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
@@ -1979,7 +1979,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if err != nil {
 			finish = "stop"
 		}
-		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
+		usage, upstream := openAIUsage(res, int64(pt), int64(ct))
+		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}, "usage": usage}
+		if upstream {
+			usageChunk["m365_usage_source"] = "upstream_chathub"
+		}
 		_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(usageChunk)+"\n\n")
 		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 	} else {
@@ -2155,7 +2159,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		_ = sseRaw(r.Context(), w, flusher, "data: "+string(b)+"\n\n")
 		pt := EstimateTokens(prompt)
 		ct := EstimateTokens(res.Text)
-		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
+		usage, upstream := openAIUsage(res, int64(pt), int64(ct))
+		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}, "usage": usage}
+		if upstream {
+			usageChunk["m365_usage_source"] = "upstream_chathub"
+		}
 		_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(usageChunk)+"\n\n")
 		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		return
@@ -2180,10 +2188,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if res.Reasoning != "" {
 		assistant["reasoning_content"] = res.Reasoning
 	}
-	// 上游 ChatHub 不返回 token 计数，按请求/回复文本本地估算填充
-	// OpenAI 要求的 usage 字段。
-	pt := EstimateTokens(prompt)
-	ct := EstimateTokens(res.Text)
+	// Prefer ChatHub's counters when present; otherwise use a local estimate for
+	// the OpenAI-required usage fields and mark that fact in m365 metadata.
+	pt := int64(EstimateTokens(prompt))
+	ct := int64(EstimateTokens(res.Text))
+	usage, _ := openAIUsage(res, pt, ct)
 	jsonOut(w, map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
@@ -2194,12 +2203,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			"message":       assistant,
 			"finish_reason": "stop",
 		}},
-		"m365": compatM365Metadata(res),
-		"usage": map[string]any{
-			"prompt_tokens":     pt,
-			"completion_tokens": ct,
-			"total_tokens":      pt + ct,
-		},
+		"m365":  compatM365Metadata(res),
+		"usage": usage,
 	})
 }
 

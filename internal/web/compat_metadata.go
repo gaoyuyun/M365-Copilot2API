@@ -21,6 +21,15 @@ func compatM365Metadata(res chathub.Result) map[string]any {
 		"requestId":      res.RequestID,
 		"usage_source":   "unavailable_from_chathub",
 	}
+	if !res.Usage.Empty() {
+		m["usage_source"] = "upstream_chathub"
+		m["usage_values_are_estimates"] = false
+		m["cache_creation_input_tokens"] = res.Usage.CacheCreationInputTokens
+		m["cache_read_input_tokens"] = res.Usage.CacheReadInputTokens
+	} else {
+		m["usage_values_are_estimates"] = true
+		m["cache_source"] = "not_reported_by_upstream"
+	}
 	if envTrue("M365_INCLUDE_UPSTREAM_EVENTS") {
 		m["events"] = res.Events
 	}
