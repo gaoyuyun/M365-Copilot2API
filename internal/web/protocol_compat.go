@@ -116,6 +116,13 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 					return o, fmt.Errorf("custom_tool_call_output missing call_id")
 				}
 				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: strings.TrimSpace(id), Content: m["output"]})
+			case "compaction":
+				if summary, ok := decodeCompaction(fmt.Sprint(m["encrypted_content"])); ok {
+					o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: "[compacted context]\n" + summary})
+				}
+			case "compaction_trigger":
+				// A v2 trigger is an operation marker, not conversational text.
+				continue
 			case "function_call":
 				id, _ := m["call_id"].(string)
 				name, _ := m["name"].(string)
@@ -147,6 +154,12 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 				o.Messages = append(o.Messages, oaiMsg{Role: role, Content: content})
 			}
 		}
+	case nil:
+		// Compact requests allow input to be omitted when a previous response
+		// anchor supplies the context.
+	case nil:
+		// Compact requests allow input to be omitted when a previous response
+		// anchor supplies the context.
 	default:
 		return o, fmt.Errorf("input must be string or array")
 	}
