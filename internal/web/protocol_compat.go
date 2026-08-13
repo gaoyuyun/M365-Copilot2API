@@ -27,7 +27,33 @@ type responsesRequest struct {
 	MaxOutputTokens    *int             `json:"max_output_tokens,omitempty"`
 }
 
-const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
+const customExecWorkspaceInstruction = `You are operating through the caller's local execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
+
+const codexCustomExecWorkspaceInstruction = `You are operating through the caller's local Codex execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. Custom exec accepts raw JavaScript, not shell syntax: use its documented nested exec_command tool for inspection and tests, and its nested apply_patch tool for file edits. The executor already starts in the caller-selected project workspace. Keep file targets relative to the repository root and preserve every directory component (for example, internal/web/file.go); do not reduce a nested path to its basename. When exec_command exposes workdir, use the exact cwd from environment_context or omit it to keep the workspace default. Never guess, cd to, or write under /root, /workspace, /tmp, or another project path. Inspect pwd and the target directory before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every edit, use custom exec to verify the target and run relevant tests.`
+
+// responsesInputTools extracts the tool leaves carried by Codex's
+// input/additional_tools items. Recent Codex clients group these tools inside
+// one or more namespace objects instead of sending them in the request's
+// top-level tools field.
+func responsesInputTools(raw any) []map[string]any {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	var out []map[string]any
+	for _, item := range items {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if typ, _ := tool["type"].(string); typ == "namespace" {
+			out = append(out, responsesInputTools(tool["tools"])...)
+			continue
+		}
+		out = append(out, tool)
+	}
+	return out
+}
 
 func (r responsesRequest) openAI() (oaiReq, error) {
 	o := oaiReq{Model: r.Model, AccountID: r.AccountID, Stream: r.Stream, ToolChoice: r.ToolChoice, User: r.User}
@@ -40,6 +66,8 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 	if r.MaxOutputTokens != nil {
 		o.MaxCompletionTokens = r.MaxOutputTokens
 	}
+	tools := append([]map[string]any(nil), r.Tools...)
+	fromCodexAdditionalTools := false
 	if instructions := strings.TrimSpace(r.Instructions); instructions != "" {
 		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: instructions})
 	}
@@ -61,6 +89,13 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 			}
 			typ, _ := m["type"].(string)
 			switch typ {
+			case "additional_tools":
+				// This is request metadata, not conversational content. Flatten
+				// namespace leaves into the same representation as top-level
+				// Responses tools and do not leak the declaration into the prompt.
+				tools = append(tools, responsesInputTools(m["tools"])...)
+				fromCodexAdditionalTools = true
+				continue
 			case "function_call_progress":
 				// Progress is deliberately not converted into an assistant/tool
 				// message. It is transport metadata from a long-running client-side
@@ -116,7 +151,7 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		return o, fmt.Errorf("input must be string or array")
 	}
 	hasCustomExec := false
-	for _, t := range r.Tools {
+	for _, t := range tools {
 		typ, _ := t["type"].(string)
 		name, _ := t["name"].(string)
 		if typ == "custom" && name == "exec" {
@@ -124,7 +159,7 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 			break
 		}
 	}
-	for _, t := range r.Tools {
+	for _, t := range tools {
 		typ, _ := t["type"].(string)
 		name, _ := t["name"].(string)
 		if hasCustomExec && !(typ == "custom" && name == "exec") {
@@ -144,7 +179,11 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		o.Tools = append(o.Tools, chathub.Tool{Type: typ, Function: b})
 	}
 	if hasCustomExec {
-		o.Messages = append([]oaiMsg{{Role: "system", Content: customExecWorkspaceInstruction}}, o.Messages...)
+		policy := customExecWorkspaceInstruction
+		if fromCodexAdditionalTools {
+			policy = codexCustomExecWorkspaceInstruction
+		}
+		o.Messages = append([]oaiMsg{{Role: "system", Content: policy}}, o.Messages...)
 	}
 	return o, nil
 }
@@ -159,14 +198,14 @@ type anthropicTool struct {
 	InputSchema map[string]any `json:"input_schema"`
 }
 type anthropicRequest struct {
-	Model      string             `json:"model"`
-	System     any                `json:"system,omitempty"`
-	Messages   []anthropicMessage `json:"messages"`
-	Tools      []anthropicTool    `json:"tools,omitempty"`
-	ToolChoice any                `json:"tool_choice,omitempty"`
-	Stream     bool               `json:"stream,omitempty"`
-	MaxTokens  int                `json:"max_tokens,omitempty"`
-	StopSequences []string       `json:"stop_sequences,omitempty"`
+	Model         string             `json:"model"`
+	System        any                `json:"system,omitempty"`
+	Messages      []anthropicMessage `json:"messages"`
+	Tools         []anthropicTool    `json:"tools,omitempty"`
+	ToolChoice    any                `json:"tool_choice,omitempty"`
+	Stream        bool               `json:"stream,omitempty"`
+	MaxTokens     int                `json:"max_tokens,omitempty"`
+	StopSequences []string           `json:"stop_sequences,omitempty"`
 }
 
 func (r anthropicRequest) openAI() (oaiReq, error) {

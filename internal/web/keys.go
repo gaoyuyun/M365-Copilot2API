@@ -44,6 +44,10 @@ func openAPIKeys() *apiKeyStore {
 	s := newAPIKeyStore(p)
 	b, e := os.ReadFile(p)
 	if e == nil && json.Unmarshal(b, s) == nil {
+		// Path is runtime configuration, not portable persisted state. A key
+		// file copied from the Docker container may contain `/data/...`; keep
+		// using the path selected by the current process instead.
+		s.Path = p
 		migrated := false
 		for i := range s.Keys {
 			if s.Keys[i].Raw != "" {
@@ -83,16 +87,16 @@ func (s *apiKeyStore) create(name string) (apiKeyRecord, string, error) {
 	s.mu.Lock()
 	s.Keys = append(s.Keys, r)
 	s.mu.Unlock()
-		if err := s.persist.flushNowBlocking(); err != nil {
-			s.mu.Lock()
-			s.Keys = s.Keys[:len(s.Keys)-1]
-			s.mu.Unlock()
-			return apiKeyRecord{}, "", err
-		}
-		r.Hash = ""
-		r.Raw = ""
-		return r, raw, nil
+	if err := s.persist.flushNowBlocking(); err != nil {
+		s.mu.Lock()
+		s.Keys = s.Keys[:len(s.Keys)-1]
+		s.mu.Unlock()
+		return apiKeyRecord{}, "", err
 	}
+	r.Hash = ""
+	r.Raw = ""
+	return r, raw, nil
+}
 func (s *apiKeyStore) list() []apiKeyRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
