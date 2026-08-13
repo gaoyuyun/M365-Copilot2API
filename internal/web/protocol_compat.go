@@ -26,26 +26,38 @@ type responsesRequest struct {
 	Temperature        *float64         `json:"temperature,omitempty"`
 	TopP               *float64         `json:"top_p,omitempty"`
 	MaxOutputTokens    *int             `json:"max_output_tokens,omitempty"`
-	Include            []string         `json:"include,omitempty"`
-	Text               map[string]any   `json:"text,omitempty"`
-	ServiceTier        string           `json:"service_tier,omitempty"`
-	ContextManagement  any              `json:"context_management,omitempty"`
+}
+
+const customExecWorkspaceInstruction = `You are operating through the caller's local execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
+
+const codexCustomExecWorkspaceInstruction = `You are operating through the caller's local Codex execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. Custom exec accepts raw JavaScript, not shell syntax: use its documented nested exec_command tool for inspection and tests, and its nested apply_patch tool for file edits. The executor already starts in the caller-selected project workspace. Keep file targets relative to the repository root and preserve every directory component (for example, internal/web/file.go); do not reduce a nested path to its basename. When exec_command exposes workdir, use the exact cwd from environment_context or omit it to keep the workspace default. Never guess, cd to, or write under /root, /workspace, /tmp, or another project path. Inspect pwd and the target directory before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every edit, use custom exec to verify the target and run relevant tests.`
+
+// responsesInputTools extracts the tool leaves carried by Codex's
+// input/additional_tools items. Recent Codex clients group these tools inside
+// one or more namespace objects instead of sending them in the request's
+// top-level tools field.
+func responsesInputTools(raw any) []map[string]any {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	var out []map[string]any
+	for _, item := range items {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if typ, _ := tool["type"].(string); typ == "namespace" {
+			out = append(out, responsesInputTools(tool["tools"])...)
+			continue
+		}
+		out = append(out, tool)
+	}
+	return out
 }
 
 func (r responsesRequest) openAI() (oaiReq, error) {
 	o := oaiReq{Model: r.Model, AccountID: r.AccountID, Stream: r.Stream, ToolChoice: r.ToolChoice, ParallelToolCalls: r.ParallelToolCalls, Reasoning: r.Reasoning, User: r.User}
-	if len(r.Include) != 0 {
-		return o, fmt.Errorf("unsupported_parameter: include")
-	}
-	if len(r.Text) != 0 {
-		return o, fmt.Errorf("unsupported_parameter: text")
-	}
-	if r.ServiceTier != "" {
-		return o, fmt.Errorf("unsupported_parameter: service_tier")
-	}
-	if r.ContextManagement != nil {
-		return o, fmt.Errorf("unsupported_parameter: context_management")
-	}
 	if r.Temperature != nil {
 		o.Temperature = r.Temperature
 	}
@@ -55,6 +67,8 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 	if r.MaxOutputTokens != nil {
 		o.MaxCompletionTokens = r.MaxOutputTokens
 	}
+	tools := append([]map[string]any(nil), r.Tools...)
+	fromCodexAdditionalTools := false
 	if instructions := strings.TrimSpace(r.Instructions); instructions != "" {
 		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: instructions})
 	}
@@ -62,7 +76,6 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		o.Reasoning = r.Reasoning
 		o.ReasoningEffort = r.Reasoning.Effort
 	}
-	extraTools := []map[string]any{}
 	switch v := r.Input.(type) {
 	case string:
 		if v == "" {
@@ -78,17 +91,11 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 			typ, _ := m["type"].(string)
 			switch typ {
 			case "additional_tools":
-				// Codex delivers its tool declarations inside the input array as
-				// {"type":"additional_tools","role":"developer","tools":[...]} instead
-				// of the top-level tools field. Merge them into the declaration set
-				// processed below so ChatHub learns about the available tools.
-				if tl, ok := m["tools"].([]any); ok {
-					for _, rt := range tl {
-						if t, ok := rt.(map[string]any); ok {
-							extraTools = append(extraTools, t)
-						}
-					}
-				}
+				// This is request metadata, not conversational content. Flatten
+				// namespace leaves into the same representation as top-level
+				// Responses tools and do not leak the declaration into the prompt.
+				tools = append(tools, responsesInputTools(m["tools"])...)
+				fromCodexAdditionalTools = true
 				continue
 			case "function_call_progress":
 				// Progress is deliberately not converted into an assistant/tool
@@ -144,20 +151,40 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 	default:
 		return o, fmt.Errorf("input must be string or array")
 	}
-	if len(extraTools) > 0 {
-		r.Tools = append(extraTools, r.Tools...)
-	}
-	for _, t := range r.Tools {
+	hasCustomExec := false
+	for _, t := range tools {
 		typ, _ := t["type"].(string)
 		name, _ := t["name"].(string)
+		if typ == "custom" && name == "exec" {
+			hasCustomExec = true
+			break
+		}
+	}
+	for _, t := range tools {
+		typ, _ := t["type"].(string)
+		name, _ := t["name"].(string)
+		if hasCustomExec && !(typ == "custom" && name == "exec") {
+			continue
+		}
 		f := map[string]any{"name": t["name"], "description": t["description"], "parameters": t["parameters"]}
 		if typ == "custom" && name == "exec" {
-			return o, fmt.Errorf("unsupported_parameter: tools")
+			// ChatHub accepts JSON function arguments while Codex exec accepts a
+			// grammar-constrained raw input string. Preserve the distinction in
+			// Tool.Type and bridge the input through a single string field.
+			f["parameters"] = map[string]any{"type": "object", "properties": map[string]any{"input": map[string]any{"type": "string"}}, "required": []string{"input"}, "additionalProperties": false}
+			hasCustomExec = true
 		} else if typ != "function" {
-			return o, fmt.Errorf("unsupported_parameter: tools")
+			continue
 		}
 		b, _ := json.Marshal(f)
 		o.Tools = append(o.Tools, chathub.Tool{Type: typ, Function: b})
+	}
+	if hasCustomExec {
+		policy := customExecWorkspaceInstruction
+		if fromCodexAdditionalTools {
+			policy = codexCustomExecWorkspaceInstruction
+		}
+		o.Messages = append([]oaiMsg{{Role: "system", Content: policy}}, o.Messages...)
 	}
 	return o, nil
 }

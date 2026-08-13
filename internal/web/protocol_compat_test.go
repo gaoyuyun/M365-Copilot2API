@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -69,9 +70,49 @@ func TestResponseHistoryBucketsIsolateTenantAndSession(t *testing.T) {
 
 func TestResponsesCustomExecToOpenAI(t *testing.T) {
 	r := responsesRequest{Model: "m", Input: "inspect", Tools: []map[string]any{{"type": "custom", "name": "exec", "description": "run a command", "format": map[string]any{"type": "grammar"}}}}
-	_, err := r.openAI()
-	if err == nil || !strings.Contains(err.Error(), "unsupported_parameter: tools") {
-		t.Fatalf("err=%v, want unsupported custom tool", err)
+	o, err := r.openAI()
+	if err != nil || len(o.Tools) != 1 || o.Tools[0].Type != "custom" {
+		t.Fatalf("tools=%+v err=%v", o.Tools, err)
+	}
+	if string(o.Tools[0].Function) == "" || !containsJSON(o.Tools[0].Function, "input") {
+		t.Fatalf("custom exec did not receive an input schema: %s", o.Tools[0].Function)
+	}
+}
+
+func TestResponsesCodexAdditionalToolsNamespaceToOpenAI(t *testing.T) {
+	r := responsesRequest{Model: "m", Input: []any{
+		map[string]any{
+			"type": "additional_tools",
+			"role": "developer",
+			"tools": []any{map[string]any{
+				"type": "namespace",
+				"name": "functions",
+				"tools": []any{
+					map[string]any{"type": "custom", "name": "exec", "description": "Run JavaScript", "format": map[string]any{"type": "grammar"}},
+					map[string]any{"type": "function", "name": "wait", "description": "Wait for a tool", "parameters": map[string]any{"type": "object"}},
+				},
+			}},
+		},
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "edit internal/web/protocol_compat.go"}}},
+	}}
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Tools) != 1 || o.Tools[0].Type != "custom" || !containsJSON(o.Tools[0].Function, "exec") {
+		t.Fatalf("tools=%#v, want the namespaced custom exec bridge", o.Tools)
+	}
+	if len(o.Messages) != 2 || o.Messages[0].Role != "system" || o.Messages[1].Role != "user" {
+		t.Fatalf("additional_tools leaked into messages: %#v", o.Messages)
+	}
+	policy := fmt.Sprint(o.Messages[0].Content)
+	for _, want := range []string{"raw JavaScript", "apply_patch", "preserve every directory component", "internal/web/file.go", "environment_context"} {
+		if !strings.Contains(policy, want) {
+			t.Fatalf("Codex custom exec policy missing %q: %s", want, policy)
+		}
+	}
+	if got := fmt.Sprint(o.Messages[1].Content); strings.Contains(got, "additional_tools") || !strings.Contains(got, "internal/web/protocol_compat.go") {
+		t.Fatalf("user message=%s", got)
 	}
 }
 
@@ -80,9 +121,15 @@ func TestResponsesCustomExecIsExclusiveTool(t *testing.T) {
 		{"type": "custom", "name": "exec", "description": "local execution"},
 		{"type": "function", "name": "m365_search", "description": "native search"},
 	}}
-	_, err := r.openAI()
-	if err == nil || !strings.Contains(err.Error(), "unsupported_parameter: tools") {
-		t.Fatalf("err=%v, want unsupported custom tool", err)
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Tools) != 1 || o.Tools[0].Type != "custom" {
+		t.Fatalf("tools=%#v, want only custom exec", o.Tools)
+	}
+	if !strings.Contains(fmt.Sprint(o.Messages[0].Content), "Never use") {
+		t.Fatalf("missing native-tool prohibition: %#v", o.Messages)
 	}
 }
 
@@ -92,9 +139,21 @@ func TestResponsesInstructionsAndCustomExecPolicyAreSystemMessages(t *testing.T)
 		Input:        "inspect the repository",
 		Tools:        []map[string]any{{"type": "custom", "name": "exec", "description": "run a command"}},
 	}
-	_, err := r.openAI()
-	if err == nil || !strings.Contains(err.Error(), "unsupported_parameter: tools") {
-		t.Fatalf("err=%v, want unsupported custom tool", err)
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Messages) != 3 {
+		t.Fatalf("messages=%#v", o.Messages)
+	}
+	if o.Messages[0].Role != "system" || o.Messages[0].Content != customExecWorkspaceInstruction {
+		t.Fatalf("missing custom exec policy: %#v", o.Messages[0])
+	}
+	if o.Messages[1].Role != "system" || o.Messages[1].Content != r.Instructions {
+		t.Fatalf("instructions not preserved: %#v", o.Messages[1])
+	}
+	if o.Messages[2].Role != "user" || o.Messages[2].Content != r.Input {
+		t.Fatalf("input ordering changed: %#v", o.Messages[2])
 	}
 }
 
@@ -123,9 +182,15 @@ func TestResponsesAdditionalToolsToOpenAI(t *testing.T) {
 		},
 		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "run ls"}}},
 	}}
-	_, err := r.openAI()
-	if err == nil || !strings.Contains(err.Error(), "unsupported_parameter: tools") {
-		t.Fatalf("err=%v, want unsupported custom tool", err)
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Tools) != 1 || o.Tools[0].Type != "custom" {
+		t.Fatalf("tools=%#v, want only custom exec", o.Tools)
+	}
+	if o.Messages[0].Role != "system" || o.Messages[0].Content != codexCustomExecWorkspaceInstruction {
+		t.Fatalf("missing Codex custom exec policy: %#v", o.Messages[0])
 	}
 }
 

@@ -107,6 +107,47 @@ func (p *pipeResponseWriter) Write(b []byte) (int, error) {
 }
 func (p *pipeResponseWriter) Flush() {}
 
+type responsesToolCallState struct {
+	ID, Name, Args, Type string
+	ItemID               string
+	Added                bool
+	EmittedArgs          int
+}
+
+// accumulateResponsesToolCall applies one OpenAI chat-completions tool delta
+// before the Responses output_item.added event is emitted. Codex validates the
+// item identity at that event, so call_id and name must not be left blank when
+// they are already present in the same delta.
+func accumulateResponsesToolCall(calls map[int]*responsesToolCallState, tc map[string]any) (int, *responsesToolCallState, bool, string) {
+	rawIndex, ok := tc["index"].(float64)
+	if !ok || rawIndex < 0 {
+		return 0, nil, false, ""
+	}
+	idx := int(rawIndex)
+	st := calls[idx]
+	created := st == nil
+	if created {
+		typ := "function"
+		prefix := "fc_"
+		if v, _ := tc["type"].(string); v == "custom" {
+			typ = "custom"
+			prefix = "ctc_"
+		}
+		st = &responsesToolCallState{ItemID: prefix + uuid.NewString(), Type: typ}
+		calls[idx] = st
+	}
+	if v, ok := tc["id"].(string); ok {
+		st.ID = v
+	}
+	fn, _ := tc["function"].(map[string]any)
+	if v, ok := fn["name"].(string); ok {
+		st.Name += v
+	}
+	argDelta, _ := fn["arguments"].(string)
+	st.Args += argDelta
+	return idx, st, created, argDelta
+}
+
 // streamResponsesAdapter converts the internal OpenAI SSE incrementally instead
 // of buffering the entire completion in httptest.ResponseRecorder.
 func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, o oaiReq, model string) {
@@ -145,11 +186,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	messageID := "msg_" + uuid.NewString()
 	contentID := "txt_" + uuid.NewString()
 	textStarted := false
-	type tcState struct {
-		ID, Name, Args, Type string
-		ItemID               string
-	}
-	calls := map[int]*tcState{}
+	calls := map[int]*responsesToolCallState{}
 	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	for scanner.Scan() {
@@ -180,45 +217,23 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		}
 		if rawCalls, ok := delta["tool_calls"].([]any); ok {
 			for _, raw := range rawCalls {
-				tc, ok := raw.(map[string]any)
-				if !ok {
-					continue
-				}
-				idxFloat, ok := tc["index"].(float64)
-				if !ok {
-					continue
-				}
-				idx := int(idxFloat)
-				st := calls[idx]
-				typ := "function"
-				if v, ok := tc["type"].(string); ok && v == "custom" {
-					typ = "custom"
-				}
-				callID, _ := tc["id"].(string)
-				fn, _ := tc["function"].(map[string]any)
-				name, _ := fn["name"].(string)
+				tc, _ := raw.(map[string]any)
+				idx, st, _, _ := accumulateResponsesToolCall(calls, tc)
 				if st == nil {
-					prefix := "fc_"
-					item := map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": "", "status": "in_progress"}
-					if typ == "custom" {
-						prefix = "ctc_"
-						item = map[string]any{"type": "custom_tool_call", "call_id": callID, "name": name, "input": "", "status": "in_progress"}
-					}
-					st = &tcState{ID: callID, Name: name, ItemID: prefix + uuid.NewString(), Type: typ}
-					calls[idx] = st
-					item["id"] = st.ItemID
-					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
-				} else {
-					if callID != "" {
-						st.ID = callID
-					}
-					st.Name += name
+					continue
 				}
-				if v, ok := fn["arguments"].(string); ok {
-					st.Args += v
-					if st.Type != "custom" {
-						emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": v})
+				if !st.Added && st.ID != "" && st.Name != "" {
+					item := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": "", "status": "in_progress"}
+					if st.Type == "custom" {
+						item = map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": "", "status": "in_progress"}
 					}
+					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
+					st.Added = true
+				}
+				if st.Added && st.Type != "custom" && len(st.Args) > st.EmittedArgs {
+					argDelta := st.Args[st.EmittedArgs:]
+					emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": argDelta})
+					st.EmittedArgs = len(st.Args)
 				}
 			}
 		}
@@ -267,6 +282,9 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 				input := customToolInput(st.Args)
 				item := map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": input, "status": "completed"}
 				output = append(output, item)
+				if !st.Added {
+					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": i, "item": map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": "", "status": "in_progress"}})
+				}
 				emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": i, "item_id": item["id"], "delta": input})
 				emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": i, "item_id": item["id"], "input": input})
 				emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
@@ -274,6 +292,12 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			}
 			item := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": st.Args, "status": "completed"}
 			output = append(output, item)
+			if !st.Added {
+				emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": i, "item": map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": "", "status": "in_progress"}})
+			}
+			if len(st.Args) > st.EmittedArgs {
+				emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": i, "item_id": item["id"], "delta": st.Args[st.EmittedArgs:]})
+			}
 			emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": st.ItemID, "arguments": st.Args})
 			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
 		}

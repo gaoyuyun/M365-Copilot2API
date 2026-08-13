@@ -45,6 +45,10 @@ func openAPIKeys() *apiKeyStore {
 	s := newAPIKeyStore(p)
 	b, e := os.ReadFile(p)
 	if e == nil && json.Unmarshal(b, s) == nil {
+		// Path is runtime configuration, not portable persisted state. A key
+		// file copied from the Docker container may contain `/data/...`; keep
+		// using the path selected by the current process instead.
+		s.Path = p
 		migrated := false
 		for i := range s.Keys {
 			if s.Keys[i].Raw != "" {

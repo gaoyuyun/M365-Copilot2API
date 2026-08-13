@@ -40,6 +40,26 @@ func TestResponsesResultWritesCustomToolCall(t *testing.T) {
 	}
 }
 
+func TestResponsesResultPreservesNestedPathInCustomExecInput(t *testing.T) {
+	input := "const r = await tools.apply_patch(`*** Begin Patch\n*** Update File: internal/web/protocol_compat.go\n*** End Patch`);\ntext(r);"
+	src := customCallSource()
+	msg, _ := openAIChoice(src)
+	call := msg["tool_calls"].([]any)[0].(map[string]any)
+	fn := call["function"].(map[string]any)
+	fn["arguments"] = mustJSON(map[string]any{"input": input})
+
+	rr := httptest.NewRecorder()
+	writeResponsesResult(rr, "m", false, src)
+	var response map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	got := response["output"].([]any)[0].(map[string]any)["input"]
+	if got != input {
+		t.Fatalf("custom input changed across Responses conversion:\ngot  %q\nwant %q", got, input)
+	}
+}
+
 func TestResponsesStreamWritesCustomToolEvents(t *testing.T) {
 	rr := httptest.NewRecorder()
 	writeResponsesResult(rr, "m", true, customCallSource())
