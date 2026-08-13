@@ -105,6 +105,8 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
 
 	var text strings.Builder
+	var streamUsage map[string]any
+	var streamUsageUpstream bool
 	messageID := "msg_" + uuid.NewString()
 	contentID := "txt_" + uuid.NewString()
 	textStarted := false
@@ -122,6 +124,11 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		var chunk map[string]any
 		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk) != nil {
 			continue
+		}
+		if rawUsage, ok := chunk["usage"].(map[string]any); ok {
+			streamUsage = rawUsage
+			usageSource, _ := chunk["m365_usage_source"].(string)
+			streamUsageUpstream = usageSource == "upstream_chathub"
 		}
 		choices, _ := chunk["choices"].([]any)
 		if len(choices) == 0 {
@@ -235,7 +242,17 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		usageOutput += call.Name + call.Args
 	}
 	estimate := estimateResponsesUsage(model, o.Messages, o.Tools, o.ToolChoice, usageOutput)
-	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": estimate.Values, "m365": localUsageMetadata(estimate.Source)}
+	usage := estimate.Values
+	usageSource := estimate.Source
+	if upstreamUsage, ok := responsesUsageFromLegacyUsage(streamUsage, streamUsageUpstream); ok {
+		usage = upstreamUsage
+		usageSource = "upstream_chathub"
+	}
+	metadata := localUsageMetadata(usageSource)
+	if usageSource == "upstream_chathub" {
+		metadata = map[string]any{"usage_source": usageSource, "usage_values_are_estimates": false}
+	}
+	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": usage, "m365": metadata}
 	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
 }
 
@@ -318,15 +335,22 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	estimate := estimateResponsesUsage(firstNonEmpty(body.Model, "m365-copilot"), o.Messages, o.Tools, o.ToolChoice, outputForUsage)
-	out["usage"] = estimate.Values
-	out["m365_usage_source"] = estimate.Source
+	usage := estimate.Values
+	usageSource := estimate.Source
+	if upstreamUsage, ok := responsesUsageFromOpenAI(out); ok {
+		usage = upstreamUsage
+		usageSource = "upstream_chathub"
+	}
+	out["usage"] = usage
+	out["m365_usage_source"] = usageSource
 	s.usage.record(UsageRecord{
 		Time:         time.Now(),
 		APIKeyPrefix: extractAPIKey(r),
 		Model:        firstNonEmpty(body.Model, "m365-copilot"),
 		Endpoint:     "/v1/responses",
-		InputTokens:  int64(estimate.Values["input_tokens"].(int)),
-		OutputTokens: int64(estimate.Values["output_tokens"].(int)),
+		InputTokens:  usageValue(usage["input_tokens"]),
+		OutputTokens: usageValue(usage["output_tokens"]),
+		CacheTokens:  usageValue(usage["cache_read_input_tokens"]),
 		DurationMs:   time.Since(startedAt).Milliseconds(),
 		Status:       200,
 	})
@@ -417,13 +441,18 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	estimate := estimateResponsesUsage(firstNonEmpty(body.Model, "m365-copilot"), o.Messages, o.Tools, o.ToolChoice, "")
+	usage := estimate.Values
+	if upstreamUsage, ok := responsesUsageFromOpenAI(out); ok {
+		usage = upstreamUsage
+	}
 	s.usage.record(UsageRecord{
 		Time:         time.Now(),
 		APIKeyPrefix: extractAPIKey(r),
 		Model:        firstNonEmpty(body.Model, "m365-copilot"),
 		Endpoint:     "/v1/messages",
-		InputTokens:  int64(estimate.Values["input_tokens"].(int)),
-		OutputTokens: int64(estimate.Values["output_tokens"].(int)),
+		InputTokens:  usageValue(usage["input_tokens"]),
+		OutputTokens: usageValue(usage["output_tokens"]),
+		CacheTokens:  usageValue(usage["cache_read_input_tokens"]),
 		DurationMs:   time.Since(startedAt).Milliseconds(),
 		Status:       200,
 	})

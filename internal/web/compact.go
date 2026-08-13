@@ -163,9 +163,20 @@ func (s *Server) compactResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := firstNonEmpty(body.Model, "m365-copilot")
-	usage := estimateResponsesUsage(model, o.Messages, nil, nil, res.Text).Values
+	estimate := estimateResponsesUsage(model, o.Messages, nil, nil, res.Text)
+	usage := map[string]any{"input_tokens": estimate.Values["input_tokens"], "output_tokens": estimate.Values["output_tokens"], "total_tokens": estimate.Values["total_tokens"], "cache_creation_input_tokens": int64(0), "cache_read_input_tokens": int64(0)}
+	usageSource := estimate.Source
+	if !res.Usage.Empty() {
+		u := res.Usage
+		if u.TotalTokens == 0 {
+			u.TotalTokens = u.InputTokens + u.OutputTokens
+		}
+		usage = map[string]any{"input_tokens": u.InputTokens, "output_tokens": u.OutputTokens, "total_tokens": u.TotalTokens, "cache_creation_input_tokens": u.CacheCreationInputTokens, "cache_read_input_tokens": u.CacheReadInputTokens}
+		usageSource = "upstream_chathub"
+	}
 	id := "resp_" + uuid.NewString()
 	resource := compactionResource(model, item, id, usage)
+	resource["m365"] = map[string]any{"usage_source": usageSource, "usage_values_are_estimates": usageSource != "upstream_chathub"}
 	// A compact response is also a valid previous_response_id anchor. Store
 	// the decoded form so the next request does not need to understand our
 	// envelope and does not replay the full pre-compaction history.
@@ -174,7 +185,7 @@ func (s *Server) compactResponses(w http.ResponseWriter, r *http.Request) {
 			s.storeResponseHistory(extractAPIKey(r), id, []oaiMsg{{Role: "system", Content: "[compacted context]\n" + summary}})
 		}
 	}
-	s.usage.record(UsageRecord{Time: time.Now(), APIKeyPrefix: extractAPIKey(r), AccountEmail: acc.Email, Model: model, Endpoint: "/v1/responses/compact", InputTokens: int64(usage["input_tokens"].(int)), OutputTokens: int64(usage["output_tokens"].(int)), DurationMs: time.Since(startedAt).Milliseconds(), Status: http.StatusOK})
+	s.usage.record(UsageRecord{Time: time.Now(), APIKeyPrefix: extractAPIKey(r), AccountEmail: acc.Email, Model: model, Endpoint: "/v1/responses/compact", InputTokens: usageValue(usage["input_tokens"]), OutputTokens: usageValue(usage["output_tokens"]), CacheTokens: usageValue(usage["cache_read_input_tokens"]), DurationMs: time.Since(startedAt).Milliseconds(), Status: http.StatusOK})
 	if body.Stream {
 		writeCompactionStream(w, r, resource, item)
 		return

@@ -40,7 +40,11 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 	if usageSource == "" {
 		usageSource = usageSourceHeuristic
 	}
-	resp := map[string]any{"id": id, "object": "response", "created_at": time.Now().Unix(), "status": "completed", "model": model, "output": output, "usage": usage, "m365": localUsageMetadata(usageSource)}
+	metadata := localUsageMetadata(usageSource)
+	if usageSource == "upstream_chathub" {
+		metadata = map[string]any{"usage_source": usageSource, "usage_values_are_estimates": false}
+	}
+	resp := map[string]any{"id": id, "object": "response", "created_at": time.Now().Unix(), "status": "completed", "model": model, "output": output, "usage": usage, "m365": metadata}
 	if !stream {
 		jsonOut(w, resp)
 		return

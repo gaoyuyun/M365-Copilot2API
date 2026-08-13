@@ -89,6 +89,7 @@ type Result struct {
 	Events         []json.RawMessage
 	Normalized     []Event
 	Images         []string
+	Usage          Usage
 }
 
 type Client struct {
@@ -264,6 +265,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var events []json.RawMessage
 	seenStreamTools := map[string]bool{}
 	var reasoningBuf strings.Builder
+	var usage Usage
 
 	deadline := time.Now().Add(5 * time.Minute)
 	type wsRead struct {
@@ -309,6 +311,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 1 && target == "update" {
+				usage = mergeUsage(usage, usageFromRaw(obj))
 				args, _ := obj["arguments"].([]any)
 				for _, raw := range args {
 					arg, ok := raw.(map[string]any)
@@ -375,6 +378,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 2 {
+				usage = mergeUsage(usage, usageFromRaw(obj))
 				item, _ := obj["item"].(map[string]any)
 				if item != nil {
 					if thr, ok := item["throttling"]; ok {
@@ -395,6 +399,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 3 {
+				usage = mergeUsage(usage, usageFromRaw(obj))
 				if errObj, ok := obj["error"].(map[string]any); ok {
 					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
 				}
@@ -418,6 +423,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					Events:         events,
 					Normalized:     NormalizeEvents(events),
 					Images:         imageURLs(events),
+					Usage:          usage,
 				}, nil
 			}
 		}

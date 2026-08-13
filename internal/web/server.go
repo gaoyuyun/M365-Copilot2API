@@ -1534,6 +1534,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		if err == nil {
 			s.accountPool.MarkSuccess(acc.ID)
+			streamUsage, upstream := openAIUsage(res, int64(EstimateTokens(prompt)), int64(EstimateTokens(res.Text)))
+			usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{}, "usage": streamUsage}
+			if upstream {
+				usageChunk["m365_usage_source"] = "upstream_chathub"
+			}
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(usageChunk)+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		} else {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
@@ -1690,10 +1696,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if res.Reasoning != "" {
 		assistant["reasoning_content"] = res.Reasoning
 	}
-	// 上游 ChatHub 不返回 token 计数，按请求/回复文本本地估算填充
-	// OpenAI 要求的 usage 字段。
-	pt := EstimateTokens(prompt)
-	ct := EstimateTokens(res.Text)
+	// Prefer ChatHub's counters when present; otherwise use a local estimate for
+	// the OpenAI-required usage fields and mark that fact in m365 metadata.
+	pt := int64(EstimateTokens(prompt))
+	ct := int64(EstimateTokens(res.Text))
+	usage, _ := openAIUsage(res, pt, ct)
 	jsonOut(w, map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
@@ -1704,12 +1711,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			"message":       assistant,
 			"finish_reason": "stop",
 		}},
-		"m365": compatM365Metadata(res),
-		"usage": map[string]any{
-			"prompt_tokens":     pt,
-			"completion_tokens": ct,
-			"total_tokens":      pt + ct,
-		},
+		"m365":  compatM365Metadata(res),
+		"usage": usage,
 	})
 }
 

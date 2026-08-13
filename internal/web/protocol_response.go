@@ -64,7 +64,16 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 		}
 	}
 	_ = finish
-	out := map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stop, "stop_sequence": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}, "m365": map[string]any{"usage_source": "unavailable_from_chathub", "usage_values_are_placeholders": true}}
+	usage, usageKnown := anthropicUsage(src)
+	m365 := map[string]any{"usage_source": "unavailable_from_chathub", "usage_values_are_placeholders": !usageKnown}
+	if usageKnown {
+		if meta, ok := src["m365"].(map[string]any); ok {
+			for k, v := range meta {
+				m365[k] = v
+			}
+		}
+	}
+	out := map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stop, "stop_sequence": nil, "usage": usage, "m365": m365}
 	if !stream {
 		jsonOut(w, out)
 		return
@@ -80,7 +89,7 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 			aborted = true
 		}
 	}
-	emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}})
+	emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "usage": usage}})
 	for i, b := range blocks {
 		m, _ := b.(map[string]any)
 		startBlock := b
@@ -108,7 +117,7 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 		}
 		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
 	}
-	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}})
+	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": usage["output_tokens"], "cache_creation_input_tokens": usage["cache_creation_input_tokens"], "cache_read_input_tokens": usage["cache_read_input_tokens"]}})
 	emit("message_stop", map[string]any{"type": "message_stop"})
 }
 
