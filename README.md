@@ -53,6 +53,7 @@ M365 Copilot2API 是一个用 Go 编写的自托管网关，把微软 365 Copilo
 |------|------|
 | OpenAI 兼容 `/v1/chat/completions` | 支持流式输出与 function calling |
 | OpenAI Responses `/v1/responses` | 兼容 Responses 协议（Codex 等客户端） |
+| Responses Remote Compaction `/v1/responses/compact` | ChatHub 驱动的上下文压缩，支持 `previous_response_id` 与 `compaction_trigger` |
 | Anthropic 兼容 `/v1/messages` | Claude Code / Cursor 直连 |
 | SSE 流式输出 | 逐字实时返回，`stream: true` |
 | 工具调用转换 | OpenAI function calling ⇄ M365 工具协议，`router` / `native` 两种规划模式 |
@@ -355,6 +356,7 @@ curl http://127.0.0.1:4141/v1/messages \
 | `/v1/models` | GET | 模型目录 |
 | `/v1/chat/completions` | POST | 聊天补全（流式 / 工具调用） |
 | `/v1/responses` | POST | OpenAI Responses 协议 |
+| `/v1/responses/compact` | POST | Responses Remote Compaction（同步或 SSE） |
 | `/v1/messages` | POST | Anthropic Messages（需 `x-api-key` + `anthropic-version`） |
 | `/v1/images/generations` | POST | 图像生成 |
 | `/v1/sessions` | GET / POST | 查询会话绑定 / 按 `session_id` 查询或创建 |
