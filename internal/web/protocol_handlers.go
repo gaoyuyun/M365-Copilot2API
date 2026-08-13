@@ -270,6 +270,17 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		writeResponsesError(w, 400, "invalid_request_error", "bad json")
 		return
 	}
+	if hasCompactionTrigger(body.Input) {
+		// remote_compaction_v2 uses the normal Responses path with a final
+		// compaction_trigger item. Route it through the same ChatHub-backed
+		// compact implementation while preserving the caller's stream choice.
+		encoded, _ := json.Marshal(body)
+		r2 := r.Clone(r.Context())
+		r2.Body = io.NopCloser(bytes.NewReader(encoded))
+		r2.ContentLength = int64(len(encoded))
+		s.compactResponses(w, r2)
+		return
+	}
 	o, err := body.openAI()
 	if err != nil {
 		writeResponsesError(w, 400, "invalid_request_error", err.Error())
