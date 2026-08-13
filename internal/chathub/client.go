@@ -303,6 +303,7 @@ type Result struct {
 	StorageMessageID          string
 	References                map[string]Reference
 	Timestamps                Timestamps
+	Usage                     Usage
 }
 
 type SuggestedResponse struct {
@@ -684,6 +685,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var storageMessageID string
 	references := make(map[string]Reference)
 	var firstServiceResponse bool
+	var usage Usage
 
 	deadline := time.Now().Add(5 * time.Minute)
 	type wsRead struct {
@@ -811,6 +813,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 1 && target == "update" {
+				usage = mergeUsage(usage, usageFromRaw(obj))
 				args, _ := obj["arguments"].([]any)
 				for _, raw := range args {
 					arg, ok := raw.(map[string]any)
@@ -1008,6 +1011,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 2 {
+				usage = mergeUsage(usage, usageFromRaw(obj))
 				item, _ := obj["item"].(map[string]any)
 				if item != nil {
 					if smid, ok := item["storageMessageId"].(string); ok && smid != "" {
@@ -1071,6 +1075,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			}
 
 			if int(t) == 3 {
+				usage = mergeUsage(usage, usageFromRaw(obj))
 				if errObj, ok := obj["error"].(map[string]any); ok {
 					returnConn = false
 					errCode, _ := errObj["code"].(string)
@@ -1146,6 +1151,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					Normalized:                NormalizeEvents(events),
 					Images:                    imageURLs(events),
 					Timestamps:                ts,
+					Usage:                     usage,
 				}
 				return result, nil
 			}

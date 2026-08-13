@@ -2573,7 +2573,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if err != nil {
 			finish = "error"
 		}
-		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
+		usage, upstream := openAIUsage(res, int64(pt), int64(ct))
+		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}, "usage": usage}
+		if upstream {
+			usageChunk["m365_usage_source"] = "upstream_chathub"
+		}
 		if res.Throttling != nil {
 			usageChunk["x_m365_throttling"] = res.Throttling
 		}
@@ -2815,7 +2819,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		_ = sw3.data(string(b))
 		pt := EstimateTokens(prompt)
 		ct := EstimateTokens(res.Text)
-		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
+		usage, upstream := openAIUsage(res, int64(pt), int64(ct))
+		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}, "usage": usage}
+		if upstream {
+			usageChunk["m365_usage_source"] = "upstream_chathub"
+		}
 		if res.Throttling != nil {
 			usageChunk["x_m365_throttling"] = res.Throttling
 		}
@@ -2866,6 +2874,9 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			w.Header().Set("X-M365-Scores", string(b))
 		}
 	}
+	// Prefer ChatHub's counters when present; otherwise use a local estimate for
+	// the OpenAI-required usage fields and mark that fact in m365 metadata.
+	usage, _ := openAIUsage(res, int64(pt), int64(ct))
 	jsonOut(w, map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
@@ -2876,12 +2887,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			"message":       assistant,
 			"finish_reason": "stop",
 		}},
-		"m365": compatM365Metadata(res),
-		"usage": map[string]any{
-			"prompt_tokens":     pt,
-			"completion_tokens": ct,
-			"total_tokens":      pt + ct,
-		},
+		"m365":  compatM365Metadata(res),
+		"usage": usage,
 	})
 }
 
