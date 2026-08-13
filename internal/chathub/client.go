@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -229,8 +230,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 	// ChatHub signals text either as a full snapshot or as cursor rewrites.
 	// Only the portion not already streamed may be emitted; naive prefix
-	// checks misfire when upstream rewrites the whole buffer, which duplicated
-	// answers (AAA…). Match any overlap and emit the tail.
+	// checks misfire when an update starts in the middle of the already
+	// streamed answer (a common pattern near the final sentence). Match the
+	// largest suffix/prefix overlap so only genuinely new text is emitted.
 	// Upstream rate limiting surfaces as a human-readable notice on the text
 	// channel instead of an HTTP 429. Detect it before any real content has
 	// streamed so the web layer can fail over rather than answer with it.
@@ -254,20 +256,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if rateLimited(snapshot) {
 			return ErrRateLimitNotice
 		}
-		cur := streamed.String()
-		if cur == "" {
-			return emitDelta(snapshot)
-		}
-		if strings.HasPrefix(snapshot, cur) {
-			return emitDelta(strings.TrimPrefix(snapshot, cur))
-		}
-		if i := strings.Index(snapshot, cur); i >= 0 {
-			return emitDelta(snapshot[i+len(cur):])
-		}
-		if len(snapshot) > len(cur) && strings.HasSuffix(snapshot, cur) {
-			return emitDelta(snapshot[:len(snapshot)-len(cur)])
-		}
-		return emitDelta(snapshot)
+		return emitDelta(unseenSnapshot(streamed.String(), snapshot))
 	}
 	var final string
 	var throttling any
@@ -393,12 +382,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					}
 					if res, ok := item["result"].(map[string]any); ok {
 						rawResult, _ = res["value"].(string)
-				if msg, ok := res["message"].(string); ok {
-						final = msg
-						if rateLimited(final) {
-							return Result{}, ErrRateLimitNotice
+						if msg, ok := res["message"].(string); ok {
+							final = msg
+							if rateLimited(final) {
+								return Result{}, ErrRateLimitNotice
+							}
 						}
-					}
 					}
 				}
 				// completion frame often follows; keep reading a bit but we already have content
@@ -438,6 +427,78 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// an incomplete upstream response. Do not return accumulated deltas as if
 	// they were a successful, finished answer.
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
+}
+
+// unseenSnapshot returns the part of snapshot that was not already emitted.
+// ChatHub normally sends cumulative snapshots, but it can also send a suffix
+// of the previous snapshot followed by new text. The latter is especially
+// common while it is finishing a long answer. A longest-overlap match avoids
+// replaying the already visible tail when neither value contains the other.
+func unseenSnapshot(previous, snapshot string) string {
+	if snapshot == "" || previous == "" {
+		return snapshot
+	}
+	if strings.HasPrefix(snapshot, previous) {
+		return snapshot[len(previous):]
+	}
+	if i := strings.Index(snapshot, previous); i >= 0 {
+		return snapshot[i+len(previous):]
+	}
+	if len(snapshot) > len(previous) && strings.HasSuffix(snapshot, previous) {
+		return snapshot[:len(snapshot)-len(previous)]
+	}
+	// A delayed/stale frame may contain only the already emitted prefix or
+	// suffix. Treat those frames as empty rather than replaying the fragment.
+	// Avoid suppressing arbitrary interior matches: a legitimate new sentence
+	// can repeat a short phrase from earlier in the answer.
+	if strings.HasPrefix(previous, snapshot) || strings.HasSuffix(previous, snapshot) {
+		return ""
+	}
+
+	// KMP finds the longest prefix of snapshot that is a suffix of previous in
+	// linear time, avoiding quadratic scans for long context snapshots.
+	pattern := []byte(snapshot)
+	prefix := make([]int, len(pattern))
+	for i, j := 1, 0; i < len(pattern); i++ {
+		for j > 0 && pattern[i] != pattern[j] {
+			j = prefix[j-1]
+		}
+		if pattern[i] == pattern[j] {
+			j++
+		}
+		prefix[i] = j
+	}
+	overlap := 0
+	for _, b := range []byte(previous) {
+		for overlap > 0 && b != pattern[overlap] {
+			overlap = prefix[overlap-1]
+		}
+		if b == pattern[overlap] {
+			overlap++
+		}
+		if overlap == len(pattern) {
+			overlap = prefix[overlap-1]
+		}
+	}
+	for overlap > 0 && !validUTF8Split(previous, snapshot, overlap) {
+		overlap = prefix[overlap-1]
+	}
+	// A one-rune overlap is common between adjacent incremental deltas (for
+	// example, previous="a", snapshot="apple"). Do not treat that as a
+	// replay, or the first rune of legitimate new text would be lost.
+	if overlap > 0 && utf8.RuneCountInString(snapshot[:overlap]) < 2 {
+		overlap = 0
+	}
+	return snapshot[overlap:]
+}
+
+func validUTF8Split(previous, snapshot string, overlap int) bool {
+	if overlap <= 0 {
+		return true
+	}
+	return utf8.ValidString(previous[len(previous)-overlap:]) &&
+		utf8.ValidString(snapshot[:overlap]) &&
+		utf8.ValidString(snapshot[overlap:])
 }
 
 func buildWSURL(acc Account, sessionID, conversationID, requestID string) (string, error) {
