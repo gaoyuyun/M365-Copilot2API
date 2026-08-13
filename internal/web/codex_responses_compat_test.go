@@ -113,3 +113,22 @@ func TestResponsesStreamEmitsFailedForInnerRequestError(t *testing.T) {
 		t.Fatalf("unexpected completion event in %s", body)
 	}
 }
+
+func TestResponsesStreamingToolCallStatePreservesIdentityAndArguments(t *testing.T) {
+	calls := map[int]*responsesToolCallState{}
+	idx, first, created, delta := accumulateResponsesToolCall(calls, map[string]any{
+		"index": float64(0), "id": "call_edit", "type": "function",
+		"function": map[string]any{"name": "workspace_write_file", "arguments": `{"path":"internal/web/`},
+	})
+	if idx != 0 || !created || delta != `{"path":"internal/web/` || first.ID != "call_edit" || first.Name != "workspace_write_file" || first.ItemID == "" {
+		t.Fatalf("first delta state=%#v idx=%d created=%t delta=%q", first, idx, created, delta)
+	}
+	itemID := first.ItemID
+	_, second, created, delta := accumulateResponsesToolCall(calls, map[string]any{
+		"index":    float64(0),
+		"function": map[string]any{"arguments": `protocol_compat.go"}`},
+	})
+	if created || delta != `protocol_compat.go"}` || second.ItemID != itemID || second.Args != `{"path":"internal/web/protocol_compat.go"}` {
+		t.Fatalf("second delta state=%#v created=%t delta=%q", second, created, delta)
+	}
+}
