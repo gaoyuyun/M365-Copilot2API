@@ -1,6 +1,39 @@
 package web
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestAPIKeyStoreUsesConfiguredPathAfterDockerImport(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "api-keys.json")
+	persisted := map[string]any{
+		"Path": "/data/api-keys.json",
+		"keys": []apiKeyRecord{},
+	}
+	b, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("M365_API_KEYS", path)
+
+	store := openAPIKeys()
+	if store.Path != path {
+		t.Fatalf("store path = %q, want configured path %q", store.Path, path)
+	}
+	if _, _, err := store.create("portable"); err != nil {
+		t.Fatalf("create with imported Docker key file: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("configured key file was not persisted: %v", err)
+	}
+}
 
 func TestAPIKeyCreateRollsBackWhenPersistenceFails(t *testing.T) {
 	store := newAPIKeyStore(t.TempDir())

@@ -25,6 +25,43 @@ func TestResponsesCustomExecToOpenAI(t *testing.T) {
 	}
 }
 
+func TestResponsesCodexAdditionalToolsNamespaceToOpenAI(t *testing.T) {
+	r := responsesRequest{Model: "m", Input: []any{
+		map[string]any{
+			"type": "additional_tools",
+			"role": "developer",
+			"tools": []any{map[string]any{
+				"type": "namespace",
+				"name": "functions",
+				"tools": []any{
+					map[string]any{"type": "custom", "name": "exec", "description": "Run JavaScript", "format": map[string]any{"type": "grammar"}},
+					map[string]any{"type": "function", "name": "wait", "description": "Wait for a tool", "parameters": map[string]any{"type": "object"}},
+				},
+			}},
+		},
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "edit internal/web/protocol_compat.go"}}},
+	}}
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Tools) != 1 || o.Tools[0].Type != "custom" || !containsJSON(o.Tools[0].Function, "exec") {
+		t.Fatalf("tools=%#v, want the namespaced custom exec bridge", o.Tools)
+	}
+	if len(o.Messages) != 2 || o.Messages[0].Role != "system" || o.Messages[1].Role != "user" {
+		t.Fatalf("additional_tools leaked into messages: %#v", o.Messages)
+	}
+	policy := fmt.Sprint(o.Messages[0].Content)
+	for _, want := range []string{"raw JavaScript", "apply_patch", "preserve every directory component", "internal/web/file.go", "environment_context"} {
+		if !strings.Contains(policy, want) {
+			t.Fatalf("Codex custom exec policy missing %q: %s", want, policy)
+		}
+	}
+	if got := fmt.Sprint(o.Messages[1].Content); strings.Contains(got, "additional_tools") || !strings.Contains(got, "internal/web/protocol_compat.go") {
+		t.Fatalf("user message=%s", got)
+	}
+}
+
 func TestResponsesCustomExecIsExclusiveTool(t *testing.T) {
 	r := responsesRequest{Input: "edit the project", Tools: []map[string]any{
 		{"type": "custom", "name": "exec", "description": "local execution"},
