@@ -177,6 +177,7 @@ func TestReasoningEffortRouting(t *testing.T) {
 		{"gpt-5.5", "low", "Gpt_5_5_Chat"},
 		{"gpt-5.5", "medium", "Gpt_5_5_Reasoning"},
 		{"gpt-5.6-reasoning", "none", "Gpt_5_6_Reasoning"},
+		{"gpt-5.6-sol", "max", "Gpt_5_6_Reasoning"},
 	}
 	for _, tc := range cases {
 		got, err := reasoningTone(tc.model, tc.effort)
