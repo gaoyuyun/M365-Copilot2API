@@ -157,9 +157,6 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 	case nil:
 		// Compact requests allow input to be omitted when a previous response
 		// anchor supplies the context.
-	case nil:
-		// Compact requests allow input to be omitted when a previous response
-		// anchor supplies the context.
 	default:
 		return o, fmt.Errorf("input must be string or array")
 	}

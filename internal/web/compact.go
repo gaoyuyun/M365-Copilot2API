@@ -196,10 +196,14 @@ func (s *Server) storeResponseHistory(tenant, id string, messages []oaiMsg) {
 	defer s.responseMu.Unlock()
 	bucket := s.responseMessages[tenant]
 	if bucket == nil {
-		bucket = map[string]respHistory{}
+		bucket = map[string]*respHistory{}
 		s.responseMessages[tenant] = bucket
 	}
 	for key, history := range bucket {
+		if history == nil {
+			delete(bucket, key)
+			continue
+		}
 		if time.Since(history.At) > time.Hour {
 			delete(bucket, key)
 		}
@@ -214,7 +218,7 @@ func (s *Server) storeResponseHistory(tenant, id string, messages []oaiMsg) {
 		}
 		delete(bucket, oldestKey)
 	}
-	bucket[id] = respHistory{At: time.Now(), Messages: append([]oaiMsg(nil), messages...)}
+	bucket[id] = &respHistory{At: time.Now(), Messages: append([]oaiMsg(nil), messages...)}
 }
 
 func writeCompactionStream(w http.ResponseWriter, r *http.Request, resource map[string]any, item map[string]any) {

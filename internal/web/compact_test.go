@@ -105,11 +105,11 @@ func TestCompactionStreamEvents(t *testing.T) {
 
 func TestStoreResponseHistoryEvictsExpiredAndOldest(t *testing.T) {
 	now := time.Now()
-	s := &Server{responseMessages: map[string]map[string]respHistory{"tenant": {}}}
+	s := &Server{responseMessages: map[string]map[string]*respHistory{"tenant": {}}}
 	bucket := s.responseMessages["tenant"]
-	bucket["expired"] = respHistory{At: now.Add(-2 * time.Hour)}
+	bucket["expired"] = &respHistory{At: now.Add(-2 * time.Hour)}
 	for i := 0; i < maxResponsesPerTenant; i++ {
-		bucket[fmt.Sprintf("current-%03d", i)] = respHistory{At: now.Add(time.Duration(i) * time.Second)}
+		bucket[fmt.Sprintf("current-%03d", i)] = &respHistory{At: now.Add(time.Duration(i) * time.Second)}
 	}
 
 	s.storeResponseHistory("tenant", "new", []oaiMsg{{Role: "user", Content: "keep"}})
