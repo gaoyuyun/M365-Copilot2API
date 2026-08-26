@@ -232,6 +232,40 @@ func TestWriteUpstreamErrorHeaders(t *testing.T) {
 	}
 }
 
+func TestResultErrorIsExplicitAndDoesNotCoolDownAccount(t *testing.T) {
+	err := &chathub.ResultError{
+		Value:   "InvalidRequest",
+		Message: "Sorry, I wasn't able to respond to that.",
+	}
+	if got := ClassifyError(err); got != CategoryUpstreamStructured {
+		t.Fatalf("ClassifyError()=%q want %q", got, CategoryUpstreamStructured)
+	}
+
+	w := httptest.NewRecorder()
+	writeUpstreamError(w, err)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d want 502", w.Code)
+	}
+	if got := w.Header().Get("X-M365-Upstream-Result"); got != "InvalidRequest" {
+		t.Fatalf("X-M365-Upstream-Result=%q want InvalidRequest", got)
+	}
+	if !strings.Contains(w.Body.String(), `"type":"upstream_invalid_request"`) {
+		t.Fatalf("body does not expose the stable error type: %q", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), err.Message) {
+		t.Fatalf("body leaked the upstream fallback message: %q", w.Body.String())
+	}
+	if msg, code := streamUpstreamError(err); code != "upstream_invalid_request" || strings.Contains(msg, err.Message) {
+		t.Fatalf("streamUpstreamError()=(%q, %q), want sanitized InvalidRequest error", msg, code)
+	}
+
+	h := newAccountHealth()
+	h.MarkFailure("acct-result", err, time.Minute)
+	if !h.Available("acct-result") {
+		t.Fatal("request-scoped ResultError must not cool down the account")
+	}
+}
+
 func TestResolveAccountSkipsUnhealthy(t *testing.T) {
 	store := testAccountFiles(t)
 	s := &Server{tokens: store, accountPool: newAccountHealth()}

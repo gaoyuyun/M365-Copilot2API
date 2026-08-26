@@ -60,6 +60,10 @@ func ClassifyError(err error) ErrorCategory {
 	if errors.Is(err, chathub.ErrEmptyCompletion) || errors.Is(err, chathub.ErrOffensiveContent) || errors.Is(err, chathub.ErrImageLimit) {
 		return CategoryUpstreamStructured
 	}
+	var resultErr *chathub.ResultError
+	if errors.As(err, &resultErr) {
+		return CategoryUpstreamStructured
+	}
 	var httpErr *UpstreamHTTPError
 	if errors.As(err, &httpErr) {
 		if httpErr.ErrorCode != "" {
@@ -652,6 +656,12 @@ func (h *accountHealth) AuthFailReason(accountID string) string {
 func (h *accountHealth) MarkFailure(accountID string, err error, window time.Duration) {
 	if window <= 0 {
 		window = 60 * time.Second
+	}
+	// A completed non-Success result is request/conversation scoped. It must be
+	// visible to callers, but it is not evidence that the account is unhealthy.
+	var resultErr *chathub.ResultError
+	if errors.As(err, &resultErr) {
+		return
 	}
 	cat := ClassifyError(err)
 	GlobalCircuitRecord(err)

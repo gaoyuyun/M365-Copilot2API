@@ -2,7 +2,6 @@ package chathub
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,15 +15,6 @@ import (
 
 	"github.com/gorilla/websocket"
 )
-
-func TestConversationReuseRequiresFreshWebSocket(t *testing.T) {
-	if shouldReusePooledConnection(Request{ConversationID: "conv", SessionID: "sess"}) {
-		t.Fatal("continuing an existing conversation on a pre-warmed websocket can return an immediate empty completion")
-	}
-	if !shouldReusePooledConnection(Request{}) {
-		t.Fatal("fresh first-turn requests should remain eligible for the connection pool")
-	}
-}
 
 func TestParseRetryAfter(t *testing.T) {
 	now := time.Date(2026, time.August, 29, 2, 0, 0, 0, time.UTC)
@@ -66,7 +56,7 @@ func TestConnPoolRealWebSocketClosesFrameChannel(t *testing.T) {
 		if err != nil {
 			return
 		}
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":6}`+rs))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("{}"+rs))
 		readDone := make(chan struct{})
 		go func() {
 			defer close(readDone)
@@ -97,15 +87,14 @@ func TestConnPoolRealWebSocketClosesFrameChannel(t *testing.T) {
 	defer pool.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	pool.Warm(ctx, Account{OID: "oid-a", TID: "tid-a"}, wsURL)
+	options := optionsForRequest(Request{})
+	pool.warmURL(ctx, "oid-a", "tid-a", wsURL, connectionIdentity{requestID: "req-a"}, options)
 
-	conn, _, frames, _, reused, err := pool.Take(ctx, "oid-a", "tid-a", wsURL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	pooled, reused := pool.Take("oid-a", "tid-a", options)
 	if !reused {
 		t.Fatal("expected warmed websocket reuse")
 	}
+	conn, frames := pooled.conn, pooled.frames
 	close(sendFrame)
 	select {
 	case _, ok := <-frames:
@@ -142,9 +131,9 @@ func TestConnPoolCancellationDoesNotLeakDial(t *testing.T) {
 	before := runtime.NumGoroutine()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, _, _, _, err := pool.Take(ctx, "oid-b", "tid-b", "ws://example.test")
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, want context canceled", err)
+	pool.warmURL(ctx, "oid-b", "tid-b", "ws://example.test", connectionIdentity{}, optionsForRequest(Request{}))
+	if pooled, ok := pool.Take("oid-b", "tid-b", optionsForRequest(Request{})); ok || pooled != nil {
+		t.Fatal("a canceled warm must not park a connection")
 	}
 	time.Sleep(50 * time.Millisecond)
 	if after := runtime.NumGoroutine(); after > before+1 {
@@ -190,14 +179,13 @@ func TestConnPoolCloseUnblocksSlowConsumer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	pool.Warm(ctx, Account{OID: "oid-slow", TID: "tid-slow"}, wsURL)
-	conn, _, frames, _, reused, err := pool.Take(ctx, "oid-slow", "tid-slow", wsURL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	options := optionsForRequest(Request{})
+	pool.warmURL(ctx, "oid-slow", "tid-slow", wsURL, connectionIdentity{requestID: "req-slow"}, options)
+	pooled, reused := pool.Take("oid-slow", "tid-slow", options)
 	if !reused {
 		t.Fatal("expected warmed websocket reuse")
 	}
+	conn, frames := pooled.conn, pooled.frames
 
 	close(sendFrames)
 	time.Sleep(50 * time.Millisecond)
@@ -268,14 +256,13 @@ func TestConnPoolActiveWebSocketGoroutinesReturnToSteadyState(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	pool.Warm(ctx, Account{OID: "oid-active", TID: "tid-active"}, wsURL)
-	conn, _, _, _, reused, err := pool.Take(ctx, "oid-active", "tid-active", wsURL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	options := optionsForRequest(Request{})
+	pool.warmURL(ctx, "oid-active", "tid-active", wsURL, connectionIdentity{requestID: "req-active"}, options)
+	pooled, reused := pool.Take("oid-active", "tid-active", options)
 	if !reused {
 		t.Fatal("expected warmed websocket reuse")
 	}
+	conn := pooled.conn
 
 	pool.Close()
 	_ = conn.Close()
@@ -339,19 +326,18 @@ func TestConnPoolWebSocketPerformance(t *testing.T) {
 			pool := NewConnPool(websocket.DefaultDialer, nil)
 			defer pool.Close()
 			account := Account{OID: "oid-" + string(rune('a'+worker)), TID: "tid"}
+			options := optionsForRequest(Request{})
 			for index := range jobs {
 				requestStarted := time.Now()
-				pool.Warm(context.Background(), account, wsURL)
-				conn, _, _, _, hit, err := pool.Take(context.Background(), account.OID, account.TID, wsURL)
+				pool.warmURL(context.Background(), account.OID, account.TID, wsURL, connectionIdentity{}, options)
+				pooled, hit := pool.Take(account.OID, account.TID, options)
 				latencies[index] = time.Since(requestStarted)
-				if err != nil {
-					t.Errorf("websocket request failed: %v", err)
+				if !hit {
+					t.Errorf("websocket request did not hit the pool")
 					continue
 				}
-				if hit {
-					reused.Add(1)
-				}
-				_ = conn.Close()
+				reused.Add(1)
+				_ = pooled.conn.Close()
 			}
 		}(worker)
 	}
@@ -394,14 +380,15 @@ func BenchmarkConnPoolWebSocketPoolHit(b *testing.B) {
 	pool := NewConnPool(websocket.DefaultDialer, nil)
 	defer pool.Close()
 	account := Account{OID: "benchmark", TID: "tenant"}
+	options := optionsForRequest(Request{})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pool.Warm(context.Background(), account, wsURL)
-		conn, _, _, _, hit, err := pool.Take(context.Background(), account.OID, account.TID, wsURL)
-		if err != nil || !hit {
-			b.Fatalf("take failed: pool_hit=%v err=%v", hit, err)
+		pool.warmURL(context.Background(), account.OID, account.TID, wsURL, connectionIdentity{}, options)
+		pooled, hit := pool.Take(account.OID, account.TID, options)
+		if !hit {
+			b.Fatal("take failed: pool miss")
 		}
-		_ = conn.Close()
+		_ = pooled.conn.Close()
 	}
 }

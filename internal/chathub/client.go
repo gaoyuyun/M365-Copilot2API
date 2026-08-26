@@ -61,6 +61,38 @@ func checkMeteringError(mi any) error {
 	return nil
 }
 
+// ResultError reports a completed SignalR invocation whose result was not
+// successful. The upstream message is retained for server-side diagnostics,
+// but protocol adapters should expose only the stable Value classification.
+type ResultError struct {
+	Value   string
+	Message string
+}
+
+func (e *ResultError) Error() string {
+	if e == nil || strings.TrimSpace(e.Value) == "" {
+		return "chathub returned an unsuccessful result"
+	}
+	return fmt.Sprintf("chathub returned result %q", e.Value)
+}
+
+func IsInvalidRequestResult(err error) bool {
+	var resultErr *ResultError
+	return errors.As(err, &resultErr) && strings.EqualFold(strings.TrimSpace(resultErr.Value), "InvalidRequest")
+}
+
+func successfulResult(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "" || strings.EqualFold(value, "Success")
+}
+
+func validateResult(value, message string) error {
+	if successfulResult(value) {
+		return nil
+	}
+	return &ResultError{Value: value, Message: message}
+}
+
 var contentPolicyPatterns = []string{
 	"很抱歉，我无法响应",
 	"我很抱歉，我无法响应",
@@ -390,15 +422,55 @@ func (c *Client) ChatWithReasoning(ctx context.Context, acc Account, req Request
 	})
 }
 
+type chatAttemptMeta struct {
+	usedPrewarm   bool
+	outputStarted bool
+}
+
+func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler) (Result, error) {
+	meta := &chatAttemptMeta{}
+	res, err := c.chatWithHandlersAttempt(ctx, acc, req, onDelta, onEvent, true, meta)
+	if err != nil && meta.usedPrewarm && !meta.outputStarted && IsInvalidRequestResult(err) {
+		log.Printf("[connpool] pooled identity rejected oid=%s; retrying once with a fresh connection", acc.OID)
+		meta = &chatAttemptMeta{}
+		res, err = c.chatWithHandlersAttempt(ctx, acc, req, onDelta, onEvent, false, meta)
+	}
+	if err == nil {
+		c.schedulePrewarm(acc, req)
+	}
+	return res, err
+}
+
+// Prewarm creates a connection for a future new conversation. The pool owns
+// the request/session/conversation IDs and returns them together with the
+// connection when it is leased.
+func (c *Client) Prewarm(ctx context.Context, acc Account, req Request) {
+	if c == nil || c.Pool == nil {
+		return
+	}
+	c.Pool.Warm(ctx, acc, optionsForRequest(req))
+}
+
+func (c *Client) schedulePrewarm(acc Account, req Request) {
+	if c == nil || c.Pool == nil {
+		return
+	}
+	go func() {
+		warmCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		c.Prewarm(warmCtx, acc, req)
+	}()
+}
+
 // A pre-warmed websocket is created with its own conversation/session IDs.
 // It is safe for a fresh first turn, whose IDs are also generated locally, but
 // not for continuing an existing upstream conversation. Microsoft can finish
 // such mismatched continuation requests immediately with no answer text.
-func shouldReusePooledConnection(req Request) bool {
-	return req.ConversationID == "" && req.SessionID == ""
+func canUsePrewarmed(req Request) bool {
+	return req.SessionID == "" && req.ConversationID == ""
 }
 
-func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler) (Result, error) {
+func (c *Client) chatWithHandlersAttempt(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler, allowPrewarm bool, meta *chatAttemptMeta) (Result, error) {
 	startedAt := time.Now()
 	log.Printf("chathub timing start prompt_len=%d", len(req.Text))
 	if acc.AccessToken == "" || acc.OID == "" || acc.TID == "" {
@@ -410,7 +482,28 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	if req.Tone == "" {
 		req.Tone = defaultTone
 	}
+	options := optionsForRequest(req)
 	firstTurn := req.Started
+	requestID := ""
+	var conn *websocket.Conn
+	var connWriteMu *sync.Mutex
+	var poolFrames <-chan []byte
+	var poolErrs <-chan error
+	var reused bool
+	if allowPrewarm && c.Pool != nil && canUsePrewarmed(req) {
+		if pooled, ok := c.Pool.Take(acc.OID, acc.TID, options); ok {
+			conn = pooled.conn
+			connWriteMu = &pooled.writeMu
+			poolFrames = pooled.frames
+			poolErrs = pooled.errs
+			reused = true
+			meta.usedPrewarm = true
+			req.SessionID = pooled.identity.sessionID
+			req.ConversationID = pooled.identity.conversationID
+			requestID = pooled.identity.requestID
+			firstTurn = true
+		}
+	}
 	if req.SessionID == "" {
 		req.SessionID = uuid.NewString()
 		firstTurn = true
@@ -419,7 +512,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		req.ConversationID = uuid.NewString()
 		firstTurn = true
 	}
-	requestID := uuid.NewString()
+	if requestID == "" {
+		requestID = uuid.NewString()
+	}
 	wsURL, err := BuildWSURLWithOptions(acc, req.SessionID, req.ConversationID, requestID, req.LicenseType, req.Scenario, req.DisableMemory)
 	if err != nil {
 		return Result{}, err
@@ -432,34 +527,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 
 	dialStarted := time.Now()
-	var conn *websocket.Conn
-	var reused bool
 	phase = PhaseDial
-
-	var connWriteMu *sync.Mutex
-	var poolFrames <-chan []byte
-	var poolErrs <-chan error
-	if c.Pool != nil && shouldReusePooledConnection(req) {
-		var poolErr error
-		conn, connWriteMu, poolFrames, poolErrs, reused, poolErr = c.Pool.Take(ctx, acc.OID, acc.TID, wsURL)
-		if poolErr != nil {
-			if errors.Is(poolErr, context.Canceled) {
-				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: poolErr}
-			}
-			return Result{}, wrapDialError(poolErr, 0, 0)
-		}
-		if reused {
-			go func() {
-				warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				warmReqID := uuid.NewString()
-				warmSID := uuid.NewString()
-				warmCID := uuid.NewString()
-				warmURL, _ := BuildWSURL(acc, warmSID, warmCID, warmReqID, req.LicenseType, req.Scenario)
-				c.Pool.Warm(warmCtx, acc, warmURL)
-			}()
-		}
-	}
 	if conn == nil {
 		var resp *http.Response
 		conn, resp, err = c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
@@ -494,22 +562,23 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 	phase = PhaseHandshake
 
+	var writeMu sync.Mutex
+	if connWriteMu == nil {
+		connWriteMu = &writeMu
+	}
 	wsWrite := func(msgType int, data []byte) error {
-		if connWriteMu != nil {
-			connWriteMu.Lock()
-			defer connWriteMu.Unlock()
-		}
+		connWriteMu.Lock()
+		defer connWriteMu.Unlock()
+		_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		return conn.WriteMessage(msgType, data)
 	}
 
 	returnConn := false
 	defer func() {
 		if returnConn && conn != nil && c.Pool != nil {
-			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			c.Pool.Return(acc.OID, acc.TID, conn)
 		} else if conn != nil {
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -521,8 +590,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		}
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
-	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	if !reused {
+		_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+	}
 
 	if !reused {
 		if err := wsWrite(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
@@ -574,6 +644,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if d == "" {
 			return nil
 		}
+		meta.outputStarted = true
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -712,8 +783,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					} else {
 						msg = m
 					}
-				case e := <-poolErrs:
-					err = e
+				case err = <-poolErrs:
 				case <-done:
 					return
 				case <-ctx.Done():
@@ -824,6 +894,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					if onEvent != nil {
 						beforeTools := len(seenStreamTools)
 						for _, ev := range extractToolEvents(arg, seenStreamTools) {
+							meta.outputStarted = true
 							if err := onEvent(ev); err != nil {
 								returnConn = false
 								return Result{}, err
@@ -840,6 +911,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						}
 						ev.Raw = eventRaw(arg)
 						if ev.Kind != "text" && onEvent != nil {
+							meta.outputStarted = true
 							if err := onEvent(ev); err != nil {
 								returnConn = false
 								return Result{}, err
@@ -1055,6 +1127,13 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						}
 						if msg, ok := res["message"].(string); ok {
 							final = msg
+						}
+						resultErr := validateResult(rawResult, final)
+						if IsInvalidRequestResult(resultErr) {
+							returnConn = false
+							return Result{}, resultErr
+						}
+						if final != "" {
 							if imageLimitDetected(final) {
 								returnConn = false
 								return Result{}, ErrImageLimit
@@ -1067,6 +1146,10 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 								returnConn = false
 								return Result{}, ErrOffensiveContent
 							}
+						}
+						if resultErr != nil {
+							returnConn = false
+							return Result{}, resultErr
 						}
 					}
 				}

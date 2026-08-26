@@ -74,6 +74,9 @@ func applyM365Headers(w http.ResponseWriter, err error, accountID string) {
 		w.Header().Set("X-M365-Account-Id", "")
 	}
 	w.Header().Set("X-M365-Proxy-Error", string(cat))
+	if chathub.IsInvalidRequestResult(err) {
+		w.Header().Set("X-M365-Upstream-Result", "InvalidRequest")
+	}
 	if GlobalCircuitIsOpen() {
 		remaining := int(time.Until(GlobalCircuitOpenUntil()).Seconds())
 		if remaining < 0 {
@@ -110,6 +113,41 @@ func applyM365Headers(w http.ResponseWriter, err error, accountID string) {
 	}
 }
 
+func writeResultError(w http.ResponseWriter, err error) bool {
+	var resultErr *chathub.ResultError
+	if !errors.As(err, &resultErr) {
+		return false
+	}
+	if chathub.IsInvalidRequestResult(err) {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_invalid_request", "M365 rejected the conversation request; the request was not completed")
+		return true
+	}
+	writeOpenAIError(w, http.StatusBadGateway, "upstream_result_error", "M365 returned an unsuccessful completion")
+	return true
+}
+
+func streamUpstreamError(err error) (message, code string) {
+	var resultErr *chathub.ResultError
+	if errors.As(err, &resultErr) {
+		if chathub.IsInvalidRequestResult(err) {
+			return "M365 rejected the conversation request; the request was not completed", "upstream_invalid_request"
+		}
+		return "M365 returned an unsuccessful completion", "upstream_result_error"
+	}
+	switch {
+	case errors.Is(err, chathub.ErrImageLimit):
+		return "image generation daily limit reached; try again tomorrow", "image_limit_error"
+	case IsRateLimited(err):
+		return "upstream is rate limiting; try again shortly", "rate_limit_error"
+	case errors.Is(err, chathub.ErrOffensiveContent):
+		return "M365 content policy blocked this request; try again or switch account", "upstream_content_blocked"
+	case IsEmptyCompletion(err):
+		return "upstream returned empty completion; the requested model may be unavailable for this tenant", "upstream_error"
+	default:
+		return upstreamError(err), "upstream_error"
+	}
+}
+
 func writeUpstreamErrorWithAccount(w http.ResponseWriter, err error, accountID string) {
 	applyM365Headers(w, err, accountID)
 	if retry := RetryAfterSeconds(err); retry > 0 {
@@ -136,6 +174,9 @@ func writeUpstreamErrorWithAccount(w http.ResponseWriter, err error, accountID s
 	}
 	if errors.Is(err, chathub.ErrOffensiveContent) {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_content_blocked", "M365 content policy blocked this request; try again or switch account")
+		return
+	}
+	if writeResultError(w, err) {
 		return
 	}
 	writeOpenAIError(w, status, "upstream_error", upstreamError(err))
@@ -203,6 +244,9 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 	}
 	if errors.Is(err, chathub.ErrOffensiveContent) {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_content_blocked", "M365 content policy blocked this request; try again or switch account")
+		return
+	}
+	if writeResultError(w, err) {
 		return
 	}
 	writeOpenAIError(w, status, "upstream_error", upstreamError(err))

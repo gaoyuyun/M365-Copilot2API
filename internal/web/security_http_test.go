@@ -25,3 +25,22 @@ func TestRequestBodyLimitUsesConfiguredBound(t *testing.T) {
 		t.Fatalf("status=%d", rr.Code)
 	}
 }
+
+func TestAdminMiddlewareAllowsDockerHealthcheck(t *testing.T) {
+	called := false
+	s := &Server{}
+	h := s.adminMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	r := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+
+	if !called {
+		t.Fatal("/api/health was blocked by administrator authentication")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200", rr.Code)
+	}
+}
