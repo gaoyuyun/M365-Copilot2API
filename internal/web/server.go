@@ -376,6 +376,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/chat/completions", s.openaiChat)
 	m.HandleFunc("/v1/responses", s.responses)
 	m.HandleFunc("/v1/responses/compact", s.compactResponses)
+	m.HandleFunc("/v1/realtime", realtimeUnsupported)
 	m.HandleFunc("/v1/mcp/sse", mcp.HandleSSE)
 	m.HandleFunc("/v1/mcp/message", mcp.HandleMessage)
 	m.HandleFunc("/v1/mcp/tools", mcp.HandleToolsList)
@@ -385,6 +386,12 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/images/files/", s.generatedImageFile)
 	m.HandleFunc("/", s.rootPage)
 	return recoverPanics(requestID(httpTrace(securityHeaders(requestBodyLimit(sseKeepaliveMiddleware(s.adminMiddleware(s.debugMiddleware(m))))))))
+}
+
+// realtimeUnsupported gives SDKs a deterministic capability response instead
+// of falling through to the console route and receiving HTML.
+func realtimeUnsupported(w http.ResponseWriter, r *http.Request) {
+	writeOpenAIError(w, http.StatusNotImplemented, "not_implemented", "Realtime API is not supported")
 }
 
 func (s *Server) adminMiddleware(next http.Handler) http.Handler {
