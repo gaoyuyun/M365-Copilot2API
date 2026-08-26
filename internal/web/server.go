@@ -429,6 +429,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/responses", s.responses)
 	m.HandleFunc("/responses", s.responses)
 	m.HandleFunc("/v1/responses/compact", s.compactResponses)
+	m.HandleFunc("/v1/realtime", realtimeUnsupported)
 	m.HandleFunc("/v1/mcp/sse", mcp.HandleSSE)
 	m.HandleFunc("/v1/mcp/message", mcp.HandleMessage)
 	m.HandleFunc("/v1/mcp/tools", mcp.HandleToolsList)
@@ -458,6 +459,12 @@ func (s *Server) limitConcurrency(next http.Handler) http.Handler {
 			writeOpenAIError(w, http.StatusServiceUnavailable, "server_overloaded", "server is overloaded; retry shortly")
 		}
 	})
+}
+
+// realtimeUnsupported gives SDKs a deterministic capability response instead
+// of falling through to the console route and receiving HTML.
+func realtimeUnsupported(w http.ResponseWriter, r *http.Request) {
+	writeOpenAIError(w, http.StatusNotImplemented, "not_implemented", "Realtime API is not supported")
 }
 
 func (s *Server) adminMiddleware(next http.Handler) http.Handler {
