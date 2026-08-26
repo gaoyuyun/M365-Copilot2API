@@ -384,7 +384,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/images/edits", s.imageEdits)
 	m.HandleFunc("/v1/images/files/", s.generatedImageFile)
 	m.HandleFunc("/", s.rootPage)
-	return recoverPanics(requestID(httpTrace(securityHeaders(s.adminMiddleware(s.debugMiddleware(m))))))
+	return recoverPanics(requestID(httpTrace(securityHeaders(requestBodyLimit(sseKeepaliveMiddleware(s.adminMiddleware(s.debugMiddleware(m))))))))
 }
 
 func (s *Server) adminMiddleware(next http.Handler) http.Handler {

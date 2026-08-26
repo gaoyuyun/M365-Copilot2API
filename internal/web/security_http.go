@@ -1,9 +1,16 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"io/fs"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 //go:embed all:web
@@ -17,6 +24,154 @@ func init() {
 		panic(err)
 	}
 	webContent = http.FS(sub)
+}
+
+const defaultMaxRequestBodyBytes int64 = 8 << 20
+
+// requestBodyLimit is the last-resort guard for endpoints that do not have a
+// more specific decoder limit. Individual handlers may still choose a lower
+// bound for protocol-specific payloads.
+func requestBodyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil && r.Body != http.NoBody {
+			limit := defaultMaxRequestBodyBytes
+			if raw := strings.TrimSpace(os.Getenv("M365_MAX_REQUEST_BODY_BYTES")); raw != "" {
+				if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed >= 1<<20 && parsed <= 64<<20 {
+					limit = parsed
+				}
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+var (
+	sseHeartbeatTick         = 5 * time.Second
+	sseHeartbeatIdle         = 15 * time.Second
+	sseHeartbeatWriteTimeout = 5 * time.Second
+)
+
+type sseResponseWriter struct {
+	http.ResponseWriter
+	mu         sync.Mutex
+	flusher    http.Flusher
+	started    chan struct{}
+	stop       chan struct{}
+	headerOnce sync.Once
+	stopOnce   sync.Once
+	lastWrite  atomic.Int64
+}
+
+func newSSEResponseWriter(w http.ResponseWriter) *sseResponseWriter {
+	s := &sseResponseWriter{ResponseWriter: w, started: make(chan struct{}), stop: make(chan struct{})}
+	s.flusher, _ = w.(http.Flusher)
+	s.lastWrite.Store(time.Now().UnixNano())
+	return s
+}
+
+func (s *sseResponseWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+func (s *sseResponseWriter) startIfSSELocked() {
+	if !strings.HasPrefix(strings.ToLower(s.Header().Get("Content-Type")), "text/event-stream") {
+		return
+	}
+	s.headerOnce.Do(func() {
+		h := s.Header()
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Connection", "keep-alive")
+		h.Set("X-Accel-Buffering", "no")
+		close(s.started)
+	})
+}
+
+func (s *sseResponseWriter) WriteHeader(code int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startIfSSELocked()
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *sseResponseWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startIfSSELocked()
+	n, err := s.ResponseWriter.Write(p)
+	if n > 0 {
+		s.lastWrite.Store(time.Now().UnixNano())
+	}
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+	return n, err
+}
+
+func (s *sseResponseWriter) Flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startIfSSELocked()
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
+func (s *sseResponseWriter) heartbeat(ctx context.Context, cancel context.CancelFunc) {
+	select {
+	case <-s.started:
+	case <-s.stop:
+		return
+	case <-ctx.Done():
+		return
+	}
+	ticker := time.NewTicker(sseHeartbeatTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if time.Since(time.Unix(0, s.lastWrite.Load())) < sseHeartbeatIdle {
+				continue
+			}
+			if err := s.writeHeartbeat(); err != nil {
+				cancel()
+				return
+			}
+		case <-s.stop:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *sseResponseWriter) writeHeartbeat() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	controller := http.NewResponseController(s.ResponseWriter)
+	_ = controller.SetWriteDeadline(time.Now().Add(sseHeartbeatWriteTimeout))
+	n, err := s.ResponseWriter.Write([]byte(": keepalive\n\n"))
+	_ = controller.SetWriteDeadline(time.Time{})
+	if n > 0 {
+		s.lastWrite.Store(time.Now().UnixNano())
+	}
+	if err == nil && s.flusher != nil {
+		s.flusher.Flush()
+	}
+	return err
+}
+
+func (s *sseResponseWriter) closeStop() { s.stopOnce.Do(func() { close(s.stop) }) }
+
+func sseKeepaliveMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		sw := newSSEResponseWriter(w)
+		done := make(chan struct{})
+		go func() { defer close(done); sw.heartbeat(ctx, cancel) }()
+		next.ServeHTTP(sw, r.WithContext(ctx))
+		sw.closeStop()
+		<-done
+	})
 }
 
 func securityHeaders(next http.Handler) http.Handler {
