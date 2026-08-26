@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestAPIKeyStoreUsesConfiguredPathAfterDockerImport(t *testing.T) {
@@ -101,5 +102,34 @@ func TestAPIKeyDeleteRollsBackWhenPersistenceFails(t *testing.T) {
 	}
 	if len(store.Keys) != 1 || store.Keys[0].ID != record.ID {
 		t.Fatalf("key not restored after failed delete: %+v", store.Keys)
+	}
+}
+
+func TestAPIKeyExpiryAndUpdate(t *testing.T) {
+	store := newAPIKeyStore(filepath.Join(t.TempDir(), "api-keys.json"))
+	record, raw, err := store.create("short-lived", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.ExpiresAt == nil || !record.ExpiresAt.After(record.CreatedAt) {
+		t.Fatalf("missing expiry: %+v", record)
+	}
+	if !store.valid(raw) {
+		t.Fatal("fresh key should validate")
+	}
+	store.mu.Lock()
+	past := time.Now().Add(-time.Minute)
+	store.Keys[0].ExpiresAt = &past
+	store.mu.Unlock()
+	if store.valid(raw) {
+		t.Fatal("expired key should be rejected")
+	}
+	days := 0
+	updated, err := store.update(record.ID, "renamed", nil, &days)
+	if err != nil || !updated {
+		t.Fatalf("update=%v err=%v", updated, err)
+	}
+	if store.Keys[0].ExpiresAt != nil {
+		t.Fatal("zero days should clear expiry")
 	}
 }

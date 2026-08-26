@@ -3,6 +3,7 @@ package web
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -20,6 +21,7 @@ type apiKeyRecord struct {
 	Raw        string     `json:"raw,omitempty"`
 	CreatedAt  time.Time  `json:"createdAt"`
 	LastUsedAt *time.Time `json:"lastUsedAt,omitempty"`
+	ExpiresAt  *time.Time `json:"expiresAt,omitempty"`
 	Revoked    bool       `json:"revoked"`
 }
 type apiKeyStore struct {
@@ -77,13 +79,17 @@ func (s *apiKeyStore) flush() error {
 	return writeFileAtomic(s.Path, b, 0600)
 }
 func keyHash(k string) string { h := sha256.Sum256([]byte(k)); return hex.EncodeToString(h[:]) }
-func (s *apiKeyStore) create(name string) (apiKeyRecord, string, error) {
+func (s *apiKeyStore) create(name string, expiryDays ...int) (apiKeyRecord, string, error) {
 	b := make([]byte, 32)
 	if _, e := rand.Read(b); e != nil {
 		return apiKeyRecord{}, "", e
 	}
 	raw := "m365_" + hex.EncodeToString(b)
 	r := apiKeyRecord{ID: hex.EncodeToString(b[:8]), Name: name, Prefix: raw[:12], Hash: keyHash(raw), CreatedAt: time.Now()}
+	if len(expiryDays) > 0 && expiryDays[0] > 0 {
+		exp := time.Now().AddDate(0, 0, expiryDays[0])
+		r.ExpiresAt = &exp
+	}
 	s.mu.Lock()
 	s.Keys = append(s.Keys, r)
 	s.mu.Unlock()
@@ -149,22 +155,35 @@ func (s *apiKeyStore) delete(id string) (bool, error) {
 	return false, nil
 }
 
-func (s *apiKeyStore) update(id, name string, revoked *bool) (bool, error) {
+func (s *apiKeyStore) update(id, name string, revoked *bool, expiryDays ...*int) (bool, error) {
 	s.mu.Lock()
 	found := false
 	var oldName string
 	var oldRevoked bool
+	var oldExpiry *time.Time
 	for i := range s.Keys {
 		if s.Keys[i].ID != id {
 			continue
 		}
 		oldName = s.Keys[i].Name
 		oldRevoked = s.Keys[i].Revoked
+		if s.Keys[i].ExpiresAt != nil {
+			exp := *s.Keys[i].ExpiresAt
+			oldExpiry = &exp
+		}
 		if name != "" {
 			s.Keys[i].Name = name
 		}
 		if revoked != nil {
 			s.Keys[i].Revoked = *revoked
+		}
+		if len(expiryDays) > 0 && expiryDays[0] != nil {
+			if *expiryDays[0] > 0 {
+				exp := time.Now().AddDate(0, 0, *expiryDays[0])
+				s.Keys[i].ExpiresAt = &exp
+			} else {
+				s.Keys[i].ExpiresAt = nil
+			}
 		}
 		found = true
 		break
@@ -179,6 +198,7 @@ func (s *apiKeyStore) update(id, name string, revoked *bool) (bool, error) {
 			if s.Keys[i].ID == id {
 				s.Keys[i].Name = oldName
 				s.Keys[i].Revoked = oldRevoked
+				s.Keys[i].ExpiresAt = oldExpiry
 				break
 			}
 		}
@@ -190,10 +210,10 @@ func (s *apiKeyStore) update(id, name string, revoked *bool) (bool, error) {
 func (s *apiKeyStore) valid(raw string) bool {
 	s.mu.Lock()
 	h := keyHash(raw)
+	now := time.Now()
 	found := false
 	for i := range s.Keys {
-		if s.Keys[i].Hash == h && !s.Keys[i].Revoked {
-			now := time.Now()
+		if subtle.ConstantTimeCompare([]byte(s.Keys[i].Hash), []byte(h)) == 1 && !s.Keys[i].Revoked && (s.Keys[i].ExpiresAt == nil || now.Before(*s.Keys[i].ExpiresAt)) {
 			s.Keys[i].LastUsedAt = &now
 			found = true
 			break

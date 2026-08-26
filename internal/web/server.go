@@ -543,6 +543,7 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var b struct {
 			Name string `json:"name"`
+			Days int    `json:"days"`
 		}
 		if json.NewDecoder(r.Body).Decode(&b) != nil {
 			writeOpenAIError(w, 400, "invalid_request_error", "bad json")
@@ -551,7 +552,11 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(b.Name) == "" {
 			b.Name = "API key"
 		}
-		rec, raw, e := s.apiKeys.create(b.Name)
+		if b.Days < 0 || b.Days > 3650 {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "days must be between 0 and 3650")
+			return
+		}
+		rec, raw, e := s.apiKeys.create(b.Name, b.Days)
 		if e != nil {
 			writeOpenAIError(w, 500, "internal_error", e.Error())
 			return
@@ -574,12 +579,17 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 			ID      string `json:"id"`
 			Name    string `json:"name"`
 			Revoked *bool  `json:"revoked"`
+			Days    *int   `json:"days"`
 		}
 		if json.NewDecoder(r.Body).Decode(&b) != nil || b.ID == "" {
 			writeOpenAIError(w, 400, "invalid_request_error", "bad json")
 			return
 		}
-		updated, e := s.apiKeys.update(b.ID, b.Name, b.Revoked)
+		if b.Days != nil && (*b.Days < 0 || *b.Days > 3650) {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "days must be between 0 and 3650")
+			return
+		}
+		updated, e := s.apiKeys.update(b.ID, b.Name, b.Revoked, b.Days)
 		if e != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "internal_error", e.Error())
 			return
