@@ -63,11 +63,21 @@ func promptBudgetTokens(model string, value any) int64 {
 	return int64(serializedTokenCount(value, count))
 }
 
+func promptAttachmentBudgetTokens(model string, attachments []chathub.Attachment) int64 {
+	serialized := mustJSON(attachments)
+	// Base64/data URLs do not benefit from an exact BPE pass and can otherwise
+	// monopolize a CPU on large multimodal requests.
+	if len(serialized) > 32<<10 {
+		return int64((len(serialized) + 1) / 2)
+	}
+	return promptBudgetTokens(model, attachments)
+}
+
 func promptMessageBudgetTokens(model string, message oaiMsg) int64 {
 	tokens := int64(estimateMessageTokens(message, func(text string) int { return int(promptBudgetTokens(model, text)) }))
 	_, attachments := parseContent(message.Content)
 	if len(attachments) > 0 {
-		tokens += promptBudgetTokens(model, attachments)
+		tokens += promptAttachmentBudgetTokens(model, attachments)
 	}
 	return tokens
 }
@@ -110,7 +120,7 @@ func selectPromptMessages(messages []oaiMsg, model string, tools []chathub.Tool,
 		return nil, stats
 	}
 	stats.ToolTokens = promptBudgetTokens(model, tools)
-	stats.AttachmentTokens = promptBudgetTokens(model, attachments)
+	stats.AttachmentTokens = promptAttachmentBudgetTokens(model, attachments)
 	stats.PromptBudget = configuredInputBudgetTokens(model) - stats.ToolTokens - stats.AttachmentTokens - promptBudgetReserveTokens
 	if stats.PromptBudget < minimumPromptBudgetTokens {
 		stats.Exceeded, stats.ExceededReason = true, "tool definitions or attachments leave too little prompt budget"
