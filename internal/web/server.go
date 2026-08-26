@@ -441,7 +441,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/memory/instructions/", s.handleMemoryInstructionsID)
 	m.HandleFunc("/v1/memory/settings", s.handleMemorySettings)
 	m.HandleFunc("/", s.rootPage)
-	return recoverPanics(requestID(httpTrace(securityHeaders(s.limitConcurrency(s.adminMiddleware(s.debugMiddleware(m)))))))
+	return recoverPanics(requestID(httpTrace(securityHeaders(requestBodyLimit(s.limitConcurrency(sseKeepaliveMiddleware(s.adminMiddleware(s.debugMiddleware(m)))))))))
 }
 
 func (s *Server) limitConcurrency(next http.Handler) http.Handler {
