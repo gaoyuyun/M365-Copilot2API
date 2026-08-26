@@ -285,14 +285,10 @@ func (s *Server) PreheatPool() {
 			go func(a auth.AccountToken) {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
-				reqID := uuid.NewString()
-				sid := uuid.NewString()
-				cid := uuid.NewString()
-				wsURL, err := chathub.BuildWSURL(chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, sid, cid, reqID, cfg.LicenseType, cfg.Scenario)
-				if err != nil {
-					return
-				}
-				s.chat.Pool.Warm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, wsURL)
+				s.chat.Prewarm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, chathub.Request{
+					LicenseType: cfg.LicenseType,
+					Scenario:    cfg.Scenario,
+				})
 			}(acc)
 		}
 	}
@@ -403,7 +399,7 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/" || r.URL.Path == "/login" {
+		if r.URL.Path == "/api/health" || r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/" || r.URL.Path == "/login" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -2093,15 +2089,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if convReused {
 				s.invalidateConvCache(acc.ID, convCacheModel)
 			}
-			msg := upstreamError(err)
-			if IsRateLimited(err) {
-				msg = "upstream is rate limiting; try again shortly"
-			}
-			if errors.Is(err, chathub.ErrOffensiveContent) {
-				msg = "M365 content policy flagged this request as offensive"
-			}
+			msg, code := streamUpstreamError(err)
 			msg = sanitizePublicInternalText(msg)
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": code}})+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 			return
 		}
@@ -2437,15 +2427,9 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			if convReused {
 				s.invalidateConvCache(acc.ID, convCacheModel)
 			}
-			msg := upstreamError(err)
-			if IsRateLimited(err) {
-				msg = "upstream is rate limiting; try again shortly"
-			}
-			if errors.Is(err, chathub.ErrOffensiveContent) {
-				msg = "M365 content policy flagged this request as offensive"
-			}
+			msg, code := streamUpstreamError(err)
 			msg = sanitizePublicInternalText(msg)
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": code}})+"\n\n")
 		}
 		pt := EstimateTokens(prompt)
 		ct := EstimateTokens(res.Text)

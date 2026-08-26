@@ -15,20 +15,20 @@ import (
 type ErrorCategory string
 
 const (
-	CategoryQuota429          ErrorCategory = "QUOTA_429"
-	CategoryOverload503       ErrorCategory = "OVERLOAD_503"
-	CategoryAuthExpired401    ErrorCategory = "AUTH_EXPIRED_401"
-	CategoryForbidden403      ErrorCategory = "FORBIDDEN_403"
-	CategorySOCKS5            ErrorCategory = "SOCKS5"
-	CategoryDNS               ErrorCategory = "DNS"
-	CategoryTCP               ErrorCategory = "TCP"
-	CategoryTLS               ErrorCategory = "TLS"
-	CategoryWSHandshake       ErrorCategory = "WS_HANDSHAKE"
-	CategoryWSReadTimeout     ErrorCategory = "WS_READ_TIMEOUT"
+	CategoryQuota429           ErrorCategory = "QUOTA_429"
+	CategoryOverload503        ErrorCategory = "OVERLOAD_503"
+	CategoryAuthExpired401     ErrorCategory = "AUTH_EXPIRED_401"
+	CategoryForbidden403       ErrorCategory = "FORBIDDEN_403"
+	CategorySOCKS5             ErrorCategory = "SOCKS5"
+	CategoryDNS                ErrorCategory = "DNS"
+	CategoryTCP                ErrorCategory = "TCP"
+	CategoryTLS                ErrorCategory = "TLS"
+	CategoryWSHandshake        ErrorCategory = "WS_HANDSHAKE"
+	CategoryWSReadTimeout      ErrorCategory = "WS_READ_TIMEOUT"
 	CategoryUpstreamStructured ErrorCategory = "UPSTREAM_STRUCTURED"
-	CategoryClientCanceled    ErrorCategory = "CLIENT_CANCELED"
-	CategoryGlobalUnavailable ErrorCategory = "GLOBAL_UNAVAILABLE"
-	CategoryUnknown           ErrorCategory = "UNKNOWN"
+	CategoryClientCanceled     ErrorCategory = "CLIENT_CANCELED"
+	CategoryGlobalUnavailable  ErrorCategory = "GLOBAL_UNAVAILABLE"
+	CategoryUnknown            ErrorCategory = "UNKNOWN"
 )
 
 type UpstreamHTTPError struct {
@@ -52,6 +52,10 @@ func ClassifyError(err error) ErrorCategory {
 		return CategoryQuota429
 	}
 	if errors.Is(err, chathub.ErrEmptyCompletion) || errors.Is(err, chathub.ErrOffensiveContent) || errors.Is(err, chathub.ErrImageLimit) {
+		return CategoryUpstreamStructured
+	}
+	var resultErr *chathub.ResultError
+	if errors.As(err, &resultErr) {
 		return CategoryUpstreamStructured
 	}
 	var httpErr *UpstreamHTTPError
@@ -266,11 +270,11 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 }
 
 type globalCircuitState struct {
-	mu        sync.Mutex
+	mu          sync.Mutex
 	windowStart time.Time
-	total     int
-	failures  int
-	openUntil time.Time
+	total       int
+	failures    int
+	openUntil   time.Time
 }
 
 var globalCircuit = &globalCircuitState{}
@@ -350,10 +354,10 @@ func (g *globalCircuitState) Record(err error) {
 	g.mu.Unlock()
 }
 
-func GlobalCircuitIsOpen() bool { return globalCircuit.IsOpen() }
-func GlobalCircuitState() string { return globalCircuit.State() }
+func GlobalCircuitIsOpen() bool         { return globalCircuit.IsOpen() }
+func GlobalCircuitState() string        { return globalCircuit.State() }
 func GlobalCircuitOpenUntil() time.Time { return globalCircuit.OpenUntil() }
-func GlobalCircuitRecord(err error) { globalCircuit.Record(err) }
+func GlobalCircuitRecord(err error)     { globalCircuit.Record(err) }
 func ResetGlobalCircuit() {
 	globalCircuit.mu.Lock()
 	globalCircuit.windowStart = time.Time{}
@@ -508,6 +512,12 @@ func (h *accountHealth) AuthFailReason(accountID string) string {
 func (h *accountHealth) MarkFailure(accountID string, err error, window time.Duration) {
 	if window <= 0 {
 		window = 60 * time.Second
+	}
+	// A completed non-Success result is request/conversation scoped. It must be
+	// visible to callers, but it is not evidence that the account is unhealthy.
+	var resultErr *chathub.ResultError
+	if errors.As(err, &resultErr) {
+		return
 	}
 	cat := ClassifyError(err)
 	GlobalCircuitRecord(err)
