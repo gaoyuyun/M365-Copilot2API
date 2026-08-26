@@ -336,6 +336,22 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		metadata = map[string]any{"usage_source": usageSource, "usage_values_are_estimates": false}
 	}
 	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": usage, "m365": metadata}
+	stored := append([]oaiMsg(nil), o.Messages...)
+	storedCalls := make([]map[string]any, 0, len(calls))
+	for _, call := range calls {
+		storedCalls = append(storedCalls, map[string]any{"id": call.ID, "type": call.Type, "function": map[string]any{"name": call.Name, "arguments": call.Args}})
+	}
+	if len(calls) > 0 {
+		stored = append(stored, oaiMsg{Role: "assistant", ToolCalls: storedCalls})
+	} else {
+		stored = append(stored, oaiMsg{Role: "assistant", Content: text.String()})
+	}
+	tenant := tenantFromRequest(r)
+	if tenant == "" {
+		tenant = "anonymous"
+	}
+	storeKey := responseNamespace(tenant, responseSessionID(r))
+	s.storeResponseNode(storeKey, id, &RespNode{At: time.Now(), Messages: stored, ToolCalls: buildRespToolCallsMap(storedCalls), Version: 1, Consumed: false, Tenant: tenant, SessionID: responseSessionID(r)})
 	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
 }
 
@@ -460,6 +476,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		messages := append([]oaiMsg(nil), prior.Messages...)
 		newVersion := prior.Version
 		parentToolCount := len(prior.ToolCalls)
+		s.persistResponsesLocked()
 		s.responseMu.Unlock()
 		log.Printf("[responses-audit] tenantHash=%s session=%s previous=%s action=consumed version=%d tool_ids=%v parentToolCalls=%d", tenantHashPrefix(tenant), sessionHashPrefix(sessionID), body.PreviousResponseID, newVersion, toolIDs, parentToolCount)
 		if s.debug != nil {
@@ -536,29 +553,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		toolCallsMap := buildRespToolCallsMap(storedToolCalls)
-		s.responseMu.Lock()
-		bucket := s.responseMessages[nsKey]
-		if bucket == nil {
-			bucket = map[string]*RespNode{}
-			s.responseMessages[nsKey] = bucket
-		}
-		for k, h := range bucket {
-			if time.Since(h.At) > time.Hour {
-				delete(bucket, k)
-			}
-		}
-		if len(bucket) >= maxResponsesPerTenant {
-			var oldestKey string
-			var oldestAt time.Time
-			for k, h := range bucket {
-				if oldestKey == "" || h.At.Before(oldestAt) {
-					oldestKey, oldestAt = k, h.At
-				}
-			}
-			delete(bucket, oldestKey)
-		}
-		bucket[publicID] = &RespNode{At: time.Now(), Messages: stored, ToolCalls: toolCallsMap, Version: 1, Consumed: false, ParentID: body.PreviousResponseID, Tenant: tenant, SessionID: sessionID}
-		s.responseMu.Unlock()
+		s.storeResponseNode(nsKey, publicID, &RespNode{At: time.Now(), Messages: stored, ToolCalls: toolCallsMap, Version: 1, Consumed: false, ParentID: body.PreviousResponseID, Tenant: tenant, SessionID: sessionID})
 		log.Printf("[responses-audit] tenantHash=%s session=%s new=%s parent=%s toolCalls=%d version=1", tenantHashPrefix(tenant), sessionHashPrefix(sessionID), publicID, body.PreviousResponseID, len(toolCallsMap))
 	}
 	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)

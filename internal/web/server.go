@@ -195,6 +195,7 @@ type Server struct {
 	settings             *settingsStore
 	responseMu           sync.Mutex
 	responseMessages     map[string]map[string]*RespNode
+	responsePath         string
 	usage                *usageLog
 	generatedImages      map[string]generatedImage
 	convCache            *conversationCache
@@ -274,6 +275,7 @@ func New() (*Server, error) {
 			maxConcurrentRequests = parsed
 		}
 	}
+	responsePath := responseStorePath()
 	return &Server{
 		requestSlots:        make(chan struct{}, maxConcurrentRequests),
 		tokens:              store,
@@ -298,7 +300,8 @@ func New() (*Server, error) {
 		apiKeys:              openAPIKeys(),
 		debug:                openDebugStore(),
 		settings:             openSettingsStore(),
-		responseMessages:     map[string]map[string]*RespNode{},
+		responseMessages:     loadResponseMessages(responsePath),
+		responsePath:         responsePath,
 		usage:                openUsageLog(),
 		generatedImages:      map[string]generatedImage{},
 		convCache:            newConversationCache(),

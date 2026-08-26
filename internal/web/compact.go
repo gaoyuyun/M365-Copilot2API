@@ -219,6 +219,7 @@ func (s *Server) storeResponseHistory(tenant, id string, messages []oaiMsg) {
 		delete(bucket, oldestKey)
 	}
 	bucket[id] = &respHistory{At: time.Now(), Messages: append([]oaiMsg(nil), messages...)}
+	s.persistResponsesLocked()
 }
 
 func writeCompactionStream(w http.ResponseWriter, r *http.Request, resource map[string]any, item map[string]any) {
