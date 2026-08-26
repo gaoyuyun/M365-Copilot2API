@@ -1830,20 +1830,18 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"type": "tool_round_limit", "message": err.Error(), "completed_calls": len(activeLedger.Completed)}})
 		return
 	}
-	// Context budget sliding window: B = ContextWindow - MaxOutput - 512, atom-aware.
-	cfgBudget := s.settings.get()
-	budget := cfgBudget.ContextWindow - cfgBudget.MaxOutputTokens - 512
-	if budget < 1024 {
-		budget = 1024
-	}
-	if truncatedMsgs, truncated, budgetErr := slidingWindow(body.Messages, budget); budgetErr != nil {
+	// Global prompt budget accounts for message framing, tool schemas and
+	// attachments. Keep tool loops atomic and retain durable task anchors.
+	modelForBudget := firstNonEmpty(body.Model, "m365-copilot")
+	selectedMsgs, budgetStats := selectPromptMessages(body.Messages, modelForBudget, body.Tools, body.Attachments, false)
+	if budgetStats.Exceeded {
 		w.Header().Set("X-M365-Context-Truncated", "1")
-		writeOpenAIError(w, 400, "context_length_exceeded", budgetErr.Error())
+		writeOpenAIError(w, http.StatusBadRequest, "context_length_exceeded", budgetStats.ExceededReason)
 		return
-	} else if truncated {
+	} else if budgetStats.DroppedMessages > 0 {
 		w.Header().Set("X-M365-Context-Truncated", "1")
-		log.Printf("[context-budget] id=%s truncated original=%d budget=%d truncated_msgs=%d", requestID, len(body.Messages), budget, len(truncatedMsgs))
-		body.Messages = truncatedMsgs
+		log.Printf("[context-budget] id=%s original=%d selected=%d dropped=%d budget=%d prompt_tokens=%d anchors=%d tools=%d attachments=%d", requestID, budgetStats.OriginalMessages, budgetStats.SelectedMessages, budgetStats.DroppedMessages, budgetStats.PromptBudget, budgetStats.PromptTokens, budgetStats.AnchoredMessages, budgetStats.ToolTokens, budgetStats.AttachmentTokens)
+		body.Messages = selectedMsgs
 	}
 	// Preserve role boundaries when adapting OpenAI messages to ChatHub's
 	// single message.text field. This keeps system/developer instructions,
