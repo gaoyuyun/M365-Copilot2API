@@ -63,7 +63,7 @@ func TestResolveDoesNotMatchAcrossIdentity(t *testing.T) {
 	}
 }
 
-func TestResolveSingleMessageReusesForSameUser(t *testing.T) {
+func TestResolveIdenticalRequestDoesNotReplayIntoMutatedConversation(t *testing.T) {
 	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
 	sr := openSessionResolver()
 
@@ -74,8 +74,8 @@ func TestResolveSingleMessageReusesForSameUser(t *testing.T) {
 
 	res := sr.Resolve(resolverTestRequest("203.0.113.10", "client-a", "alice"),
 		&oaiReq{Messages: []oaiMsg{{Role: "user", Content: "继续"}}})
-	if res.IsNew {
-		t.Fatalf("same user re-sending a message should reuse session, got IsNew=true")
+	if !res.IsNew {
+		t.Fatalf("a replay without a new message must start a fresh conversation: %+v", res)
 	}
 }
 

@@ -7,13 +7,24 @@ import (
 	"m365-copilot2api/internal/chathub"
 )
 
-// collectStream feeds text fragments through streamEmitText the way the live
-// SSE loop does and returns everything that was emitted to the client plus the
-// residual pending buffer that a final flush would send.
+// collectStream feeds text fragments through the same incremental and final
+// flush helpers used by the live SSE loop.
 func collectStream(fragments []string) string {
-	emitted, pending := streamDuringAndPending(fragments)
-	// Final flush mirrors emitText(pending.String()) in the server.
-	return emitted + pending
+	var text, pending strings.Builder
+	var emitted strings.Builder
+	identityFilter := newPublicIdentityStreamFilter()
+	emitRaw := func(part string) error {
+		emitted.WriteString(part)
+		return nil
+	}
+	emitFiltered := func(part string) error {
+		return emitRaw(identityFilter.Push(part))
+	}
+	for _, fragment := range fragments {
+		_ = streamEmitText(chathub.StreamEvent{Kind: "text", Text: fragment}, &text, &pending, emitFiltered)
+	}
+	_ = flushStreamText(&pending, identityFilter, emitFiltered, emitRaw)
+	return emitted.String()
 }
 
 // streamDuringAndPending returns (text emitted mid-stream, residual pending).
@@ -69,5 +80,13 @@ func TestStreamPlainProse(t *testing.T) {
 	}
 	if got := collectStream(frags); got != full {
 		t.Fatalf("plain prose altered.\n want %q\n  got %q", full, got)
+	}
+}
+
+func TestStreamFlushesRetainedThreeRuneTail(t *testing.T) {
+	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "false")
+	full := "介绍你自己。"
+	if got := collectStream([]string{"介绍", "你", "自己。"}); got != full {
+		t.Fatalf("final stream tail was lost: got %q want %q", got, full)
 	}
 }

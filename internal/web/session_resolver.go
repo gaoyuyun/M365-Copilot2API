@@ -16,9 +16,16 @@ import (
 	"github.com/google/uuid"
 )
 
-// sessionBinding records a reusable content-keyed conversation. Identity
-// fields are diagnostic metadata; Resolve matches only conversation content.
+// sessionBinding records a complete conversation history scoped by tenant,
+// account and model. ContextHistory is the bounded administrator transcript;
+// HistoryHash and HistoryLen cover the full history used for continuation.
 type sessionBinding struct {
+	// Legacy bindings may point to title conversations while claiming to contain
+	// the main request. Keep their transcripts, but only reuse verified versions.
+	HistoryVersion int       `json:"historyVersion,omitempty"`
+	HistoryHash    string    `json:"historyHash,omitempty"`
+	HistoryLen     int       `json:"historyLen,omitempty"`
+	Model          string    `json:"model,omitempty"`
 	SessionID      string    `json:"sessionId"`
 	ConversationID string    `json:"conversationId"`
 	AccountID      string    `json:"accountId"`
@@ -56,6 +63,8 @@ type sessionResolver struct {
 }
 
 const defaultMaxSessions = 1000
+
+const conversationHistoryVersion = 1
 
 func openSessionResolver() *sessionResolver {
 	// Treat a session as expired after two idle hours. Expired bindings are
@@ -125,7 +134,11 @@ func (sr *sessionResolver) flush() error {
 func (sr *sessionResolver) reindexLocked(s sessionBinding) {
 	sr.sessions[s.SessionID] = s
 	if s.ExplicitID != "" {
-		sr.byExplicit[explicitKey(s.Tenant, s.ExplicitID)] = s.SessionID
+		key := explicitKey(s.Tenant, s.ExplicitID)
+		current, exists := sr.sessions[sr.byExplicit[key]]
+		if !exists || !current.LastUsedAt.After(s.LastUsedAt) {
+			sr.byExplicit[key] = s.SessionID
+		}
 	}
 	if s.UserField != "" {
 		sr.byUserField[s.UserField] = s.SessionID
@@ -162,7 +175,7 @@ func (sr *sessionResolver) evictLocked() {
 
 func (sr *sessionResolver) dropLocked(id string, s sessionBinding) {
 	delete(sr.sessions, id)
-	if s.ExplicitID != "" {
+	if s.ExplicitID != "" && sr.byExplicit[explicitKey(s.Tenant, s.ExplicitID)] == id {
 		delete(sr.byExplicit, explicitKey(s.Tenant, s.ExplicitID))
 	}
 	if sr.byUserField[s.UserField] == id {
@@ -221,11 +234,15 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	tenant := tenantFromRequest(r)
 	explicitID := r.Header.Get("X-M365-Session-Id")
 
-	// An explicit client session ID has the highest continuation priority. The
-	// caller determines which cloud conversation should continue.
+	// An explicit session selects a binding, but still must reproduce its
+	// complete history. A divergent branch starts a new cloud conversation.
 	if explicitID != "" {
 		if sessID, ok := sr.byExplicit[explicitKey(tenant, explicitID)]; ok {
 			if sess, ok := sr.sessions[sessID]; ok && sess.Tenant == tenant {
+				n := matchingSessionHistory(sess, body)
+				if n == 0 {
+					return ResolveResult{IsNew: true}
+				}
 				sess.LastUsedAt = time.Now().UTC()
 				sr.sessions[sessID] = sess
 				sr.persist.markDirty()
@@ -235,7 +252,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 					AccountID:      sess.AccountID,
 					MatchedBy:      "explicit",
 					IsNew:          false,
-					HistoryLen:     len(sess.ContextHistory),
+					HistoryLen:     n,
 				}
 			}
 		}
@@ -245,7 +262,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	// of the request under the same IP and user-agent fingerprint. HistoryLen
 	// identifies the incremental suffix to send.
 	ipFinger := clientIPFingerprint(r)
-	if bestID, n := sr.matchContextLocked(tenant, ipFinger, body.Messages); bestID != "" {
+	if bestID, n := sr.matchContextLocked(tenant, ipFinger, body); bestID != "" {
 		sess := sr.sessions[bestID]
 		sess.LastUsedAt = time.Now().UTC()
 		sr.sessions[bestID] = sess
@@ -260,80 +277,15 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		}
 	}
 
-	// As a weaker fallback, reuse a conversation whose history shares a strong
-	// suffix with a locally truncated request. The incremental boundary is unknown.
-	suffixID, suffixN := sr.matchSuffixLocked(tenant, ipFinger, body.Messages)
-	if suffixID != "" {
-		sess := sr.sessions[suffixID]
-		sess.LastUsedAt = time.Now().UTC()
-		sr.sessions[suffixID] = sess
-		sr.persist.markDirty()
-		return ResolveResult{
-			SessionID:      sess.SessionID,
-			ConversationID: sess.ConversationID,
-			AccountID:      sess.AccountID,
-			MatchedBy:      fmt.Sprintf("context_suffix_%d", suffixN),
-			IsNew:          false,
-			HistoryLen:     suffixN,
-		}
-	}
-
+	// A shared suffix cannot prove that instructions or earlier tool results
+	// match. Rebuild the cloud conversation from the supplied history instead.
 	return ResolveResult{IsNew: true}
-}
-
-func (sr *sessionResolver) matchSuffixLocked(tenant, ipFinger string, messages []oaiMsg) (string, int) {
-	if len(messages) < 2 {
-		return "", 0
-	}
-	type match struct {
-		id     string
-		n      int
-		recent time.Time
-	}
-	best := match{}
-	minSuffix := 2
-	for id, sess := range sr.sessions {
-		if time.Since(sess.LastUsedAt) > sr.contextTTL {
-			continue
-		}
-		if sess.Tenant != tenant {
-			continue
-		}
-		if sess.IPFingerprint != ipFinger {
-			continue
-		}
-		hist := sess.ContextHistory
-		if len(hist) < minSuffix {
-			continue
-		}
-		n := suffixMatchLen(hist, messages)
-		if n >= minSuffix && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
-			best = match{id: id, n: n, recent: sess.LastUsedAt}
-		}
-	}
-	return best.id, best.n
-}
-
-func suffixMatchLen(hist, msgs []oaiMsg) int {
-	maxN := len(hist)
-	if maxN > len(msgs) {
-		maxN = len(msgs)
-	}
-	n := 0
-	for i := 1; i <= maxN; i++ {
-		if messagesEqual(hist[len(hist)-i], msgs[len(msgs)-i]) {
-			n = i
-		} else {
-			break
-		}
-	}
-	return n
 }
 
 // matchContextLocked returns the most recent conversation with the longest
 // strict history prefix, plus the number of matched messages.
-func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, messages []oaiMsg) (string, int) {
-	if len(messages) == 0 {
+func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, body *oaiReq) (string, int) {
+	if len(body.Messages) == 0 {
 		return "", 0
 	}
 	type match struct {
@@ -352,7 +304,7 @@ func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, messages 
 		if sess.IPFingerprint != ipFinger {
 			continue
 		}
-		n := contextPrefixLen(sess.ContextHistory, messages)
+		n := matchingSessionHistory(sess, body)
 		if n >= 1 && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
 			best = match{id: id, n: n, recent: sess.LastUsedAt}
 		}
@@ -360,97 +312,56 @@ func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, messages 
 	return best.id, best.n
 }
 
-// contextPrefixLen returns len(hist) when hist is a strict prefix of msgs and
-// ends on an atom boundary. It returns zero otherwise.
-func contextPrefixLen(hist, msgs []oaiMsg) int {
-	if len(hist) == 0 || len(msgs) < len(hist) {
+func matchingSessionHistory(sess sessionBinding, body *oaiReq) int {
+	if sess.HistoryVersion != conversationHistoryVersion || sess.HistoryHash == "" ||
+		sess.Model != firstNonEmpty(body.Model, defaultPublicModelName) ||
+		(body.AccountID != "" && body.AccountID != sess.AccountID) {
 		return 0
 	}
-	for i := range hist {
-		if !messagesEqual(hist[i], msgs[i]) {
-			return 0
-		}
-	}
-	atoms := buildAtoms(msgs)
-	boundary := false
-	for _, a := range atoms {
-		if a.End == len(hist) {
-			boundary = true
-			break
-		}
-		if a.End > len(hist) {
-			break
-		}
-	}
-	if !boundary {
+	n := sess.HistoryLen
+	if n <= 0 || len(body.Messages) <= n || historyFingerprint(body.Messages[:n]) != sess.HistoryHash {
 		return 0
 	}
-	return len(hist)
+	return n
 }
 
-// messagesEqual compares role, content, and tool call semantics while ignoring
-// tool call IDs, which clients may regenerate when replaying the same call.
-func messagesEqual(a, b oaiMsg) bool {
-	if a.Role != b.Role {
-		return false
-	}
-	ta := contentToString(a.Content)
-	tb := contentToString(b.Content)
-	if ta != tb {
-		return false
-	}
-	if (a.ToolCalls == nil) != (b.ToolCalls == nil) {
-		return false
-	}
-	for i := range a.ToolCalls {
-		if i >= len(b.ToolCalls) {
-			return false
+// CanContinue also guards aliases from the user/session-key stores. Those
+// stores may survive upgrades, but cannot bypass the verified history check.
+func (sr *sessionResolver) CanContinue(r *http.Request, body *oaiReq, conversationID string) bool {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	for _, sess := range sr.sessions {
+		if sess.Tenant == tenantFromRequest(r) && sess.ConversationID == conversationID &&
+			time.Since(sess.LastUsedAt) <= sr.ttl && matchingSessionHistory(sess, body) > 0 {
+			return true
 		}
-		if toolCallEqual(a.ToolCalls[i], b.ToolCalls[i]) {
-			continue
-		}
-		return false
 	}
-	return len(a.ToolCalls) == len(b.ToolCalls)
+	return false
 }
 
-// toolCallEqual 比较 name 与 arguments，忽略 ID：同一段工具调用重放时
-// ID 由客户端重新生成，不应影响会话键。
-func toolCallEqual(x, y map[string]any) bool {
-	xFunc, _ := x["function"].(map[string]any)
-	yFunc, _ := y["function"].(map[string]any)
-	xn, _ := xFunc["name"].(string)
-	yn, _ := yFunc["name"].(string)
-	if xn != yn {
-		return false
-	}
-	xa, _ := xFunc["arguments"].(string)
-	ya, _ := yFunc["arguments"].(string)
-	return xa == ya
-}
-
-func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, assistantText string, r *http.Request) {
+func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, assistantText string, r *http.Request) string {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	sr.evictLocked()
 
 	tenant := tenantFromRequest(r)
 	now := time.Now().UTC()
-	history := cloneMessages(body.Messages)
+	history := append([]oaiMsg(nil), body.Messages...)
 	if strings.TrimSpace(assistantText) != "" {
 		history = append(history, oaiMsg{Role: "assistant", Content: assistantText})
 	}
 	explicitID := r.Header.Get("X-M365-Session-Id")
 
 	// Locate an existing binding to update in place, scoped to this tenant:
-	// prefer the tenant-namespaced explicit id, then any binding this tenant
-	// already holds for the same cloud conversation. This keeps one record per
-	// conversation instead of growing sessions.json on every incremental turn,
-	// and never merges into another tenant's binding.
+	// prefer the tenant-namespaced explicit id for this same cloud conversation,
+	// then any binding this tenant already holds for it. A rebuilt/branched
+	// conversation must retain its new upstream session ID and must not overwrite
+	// the old transcript just because the caller reused an explicit ID.
+	// Incremental turns update one record and never merge another tenant's binding.
 	targetKey := ""
 	if explicitID != "" {
 		if k, ok := sr.byExplicit[explicitKey(tenant, explicitID)]; ok {
-			if sess, ok := sr.sessions[k]; ok && sess.Tenant == tenant {
+			if sess, ok := sr.sessions[k]; ok && sess.Tenant == tenant && sess.ConversationID == conversationID {
 				targetKey = k
 			}
 		}
@@ -471,7 +382,11 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		sess.UserField = body.User
 		sess.IPFingerprint = clientIPFingerprint(r)
 		sess.ContextFinger = contextFingerprint(history)
-		sess.ContextHistory = history
+		sess.ContextHistory = cloneMessages(history)
+		sess.HistoryVersion = conversationHistoryVersion
+		sess.HistoryHash = historyFingerprint(history)
+		sess.HistoryLen = len(history)
+		sess.Model = firstNonEmpty(body.Model, defaultPublicModelName)
 		sess.Tenant = tenant
 		if explicitID != "" {
 			sess.ExplicitID = explicitID
@@ -479,12 +394,16 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		sr.sessions[targetKey] = sess
 		sr.reindexLocked(sess)
 		sr.persist.markDirty()
-		return
+		return sess.SessionID
 	}
 	if sessionID == "" {
 		sessionID = uuid.NewString()
 	}
 	sess := sessionBinding{
+		HistoryVersion: conversationHistoryVersion,
+		HistoryHash:    historyFingerprint(history),
+		HistoryLen:     len(history),
+		Model:          firstNonEmpty(body.Model, defaultPublicModelName),
 		SessionID:      sessionID,
 		ConversationID: conversationID,
 		AccountID:      accountID,
@@ -493,12 +412,13 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		IPFingerprint:  clientIPFingerprint(r),
 		UserField:      body.User,
 		ContextFinger:  contextFingerprint(history),
-		ContextHistory: history,
+		ContextHistory: cloneMessages(history),
 		Tenant:         tenant,
 		ExplicitID:     explicitID,
 	}
 	sr.reindexLocked(sess)
 	sr.persist.markDirty()
+	return sessionID
 }
 
 func (sr *sessionResolver) GetSession(tenant, sessionID string) (sessionBinding, bool) {
@@ -537,6 +457,31 @@ func (sr *sessionResolver) GetConversation(tenant, conversationID string) (sessi
 		}
 	}
 	return sessionBinding{}, false
+}
+
+// GetConversationForAdmin returns the most recently used local binding for a
+// cloud conversation regardless of API-key tenant. It is intentionally
+// separate from GetConversation so API-key-facing endpoints retain strict
+// tenant isolation; callers must already be protected by administrator auth.
+func (sr *sessionResolver) GetConversationForAdmin(conversationID string) (sessionBinding, bool) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	var latest sessionBinding
+	found := false
+	for _, session := range sr.sessions {
+		if session.ConversationID != conversationID {
+			continue
+		}
+		if !found || session.LastUsedAt.After(latest.LastUsedAt) {
+			latest = session
+			found = true
+		}
+	}
+	if !found {
+		return sessionBinding{}, false
+	}
+	latest.ContextHistory = cloneMessages(latest.ContextHistory)
+	return latest, true
 }
 
 func (sr *sessionResolver) ListSessions() []sessionBinding {
@@ -586,6 +531,20 @@ func (sr *sessionResolver) UnbindByConversation(conversationID string) int {
 		sr.persist.markDirty()
 	}
 	return removed
+}
+
+// RetireConversation preserves its admin transcript while disabling reuse
+// after a failed or repaired upstream turn changed the cloud history.
+func (sr *sessionResolver) RetireConversation(tenant, conversationID string) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	for id, sess := range sr.sessions {
+		if sess.Tenant == tenant && sess.ConversationID == conversationID {
+			sess.HistoryVersion = 0
+			sr.sessions[id] = sess
+			sr.persist.markDirty()
+		}
+	}
 }
 
 func cloneMessages(msgs []oaiMsg) []oaiMsg {

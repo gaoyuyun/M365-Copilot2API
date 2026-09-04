@@ -98,6 +98,10 @@ var contentPolicyPatterns = []string{
 	"我很抱歉，我无法响应",
 	"很抱歉，我无法",
 	"抱歉，我无法",
+	"it looks like i can't respond to this",
+	"it looks like i cannot respond to this",
+	"it looks like i can't chat about this",
+	"it looks like i cannot chat about this",
 	"i'm sorry, i can't respond",
 	"i'm sorry, i cannot respond",
 	"i apologize, i cannot",
@@ -107,7 +111,10 @@ func IsContentPolicyBlock(text string) bool {
 	if len(text) > 300 {
 		return false
 	}
-	low := strings.ToLower(text)
+	// M365 alternates between straight and typographic apostrophes in the
+	// refusal template. Normalize them before matching so either form follows
+	// the content-policy error path instead of being stored as an answer.
+	low := strings.ToLower(strings.NewReplacer("’", "'", "‘", "'").Replace(text))
 	for _, p := range contentPolicyPatterns {
 		if strings.Contains(low, strings.ToLower(p)) {
 			return true

@@ -183,6 +183,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
 
 	var text strings.Builder
+	var reasoning strings.Builder
 	var streamUsage map[string]any
 	var streamUsageUpstream bool
 	messageID := "msg_" + uuid.NewString()
@@ -214,6 +215,9 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		}
 		choice, _ := choices[0].(map[string]any)
 		delta, _ := choice["delta"].(map[string]any)
+		if part, ok := delta["reasoning_content"].(string); ok {
+			reasoning.WriteString(part)
+		}
 		if content, ok := delta["content"].(string); ok && content != "" {
 			text.WriteString(content)
 			if !textStarted {
@@ -274,12 +278,12 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	output := []any{}
+	keys := make([]int, 0, len(calls))
+	for k := range calls {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
 	if len(calls) > 0 {
-		keys := make([]int, 0, len(calls))
-		for k := range calls {
-			keys = append(keys, k)
-		}
-		sort.Ints(keys)
 		for _, i := range keys {
 			st := calls[i]
 			if st == nil {
@@ -338,14 +342,15 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": usage, "m365": metadata}
 	stored := append([]oaiMsg(nil), o.Messages...)
 	storedCalls := make([]map[string]any, 0, len(calls))
-	for _, call := range calls {
+	for _, index := range keys {
+		call := calls[index]
 		storedCalls = append(storedCalls, map[string]any{"id": call.ID, "type": call.Type, "function": map[string]any{"name": call.Name, "arguments": call.Args}})
 	}
-	if len(calls) > 0 {
-		stored = append(stored, oaiMsg{Role: "assistant", ToolCalls: storedCalls})
-	} else {
-		stored = append(stored, oaiMsg{Role: "assistant", Content: text.String()})
+	reply := oaiMsg{Role: "assistant", ToolCalls: storedCalls, ReasoningContent: reasoning.String()}
+	if text.Len() > 0 || len(calls) == 0 {
+		reply.Content = text.String()
 	}
+	stored = append(stored, reply)
 	tenant := tenantFromRequest(r)
 	if tenant == "" {
 		tenant = "anonymous"
@@ -537,6 +542,8 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		stored := append([]oaiMsg(nil), o.Messages...)
 		var storedToolCalls []map[string]any
 		if msg, _ := openAIChoice(out); msg != nil {
+			reasoning, _ := msg["reasoning_content"].(string)
+			reply := oaiMsg{Role: "assistant", Content: msg["content"], ReasoningContent: reasoning}
 			if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
 				converted := make([]map[string]any, 0, len(calls))
 				for _, call := range calls {
@@ -544,13 +551,10 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 						converted = append(converted, m)
 					}
 				}
-				stored = append(stored, oaiMsg{Role: "assistant", ToolCalls: converted})
+				reply.ToolCalls = converted
 				storedToolCalls = converted
-			} else {
-				if text, _ := msg["content"].(string); text != "" {
-					stored = append(stored, oaiMsg{Role: "assistant", Content: text})
-				}
 			}
+			stored = append(stored, reply)
 		}
 		toolCallsMap := buildRespToolCallsMap(storedToolCalls)
 		s.storeResponseNode(nsKey, publicID, &RespNode{At: time.Now(), Messages: stored, ToolCalls: toolCallsMap, Version: 1, Consumed: false, ParentID: body.PreviousResponseID, Tenant: tenant, SessionID: sessionID})

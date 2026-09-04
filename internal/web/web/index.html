@@ -907,6 +907,8 @@ const localeText={
   'Disabled': {'zh-CN':'已禁用','zh-TW':'已停用','ja':'無効','ko':'비활성','es':'Deshabilitado','fr':'Désactivé','de':'Deaktiviert','pt-BR':'Desativado','ru':'Отключен','ar':'معطل'},
   'Enable': {'zh-CN':'启用','zh-TW':'啟用','ja':'有効にする','ko':'활성화','es':'Habilitar','fr':'Activer','de':'Aktivieren','pt-BR':'Ativar','ru':'Включить','ar':'تفعيل'},
   'No conversations': {'zh-CN':'暂无对话','zh-TW':'暫無對話','ja':'会話はありません','ko':'대화 없음','es':'No hay conversaciones','fr':'Aucune conversation','de':'Keine Unterhaltungen','pt-BR':'Nenhuma conversa','ru':'Нет разговоров','ar':'لا توجد محادثات'},
+  'Cloud only': {'zh-CN':'仅云端','zh-TW':'僅雲端','ja':'クラウドのみ','ko':'클라우드 전용','es':'Solo en la nube','fr':'Cloud uniquement','de':'Nur Cloud','pt-BR':'Somente na nuvem','ru':'Только в облаке','ar':'سحابي فقط'},
+  'No local transcript: only conversations created through this gateway keep their history': {'zh-CN':'没有本地记录：只有经由本网关创建的对话才会保留历史','zh-TW':'沒有本機記錄：只有經由本閘道建立的對話才會保留歷史','ja':'ローカルの記録がありません。履歴が保持されるのはこのゲートウェイ経由で作成された会話のみです','ko':'로컬 기록 없음: 이 게이트웨이를 통해 생성된 대화만 기록이 유지됩니다','es':'Sin transcripción local: solo las conversaciones creadas a través de esta pasarela conservan su historial','fr':'Aucune transcription locale : seules les conversations créées via cette passerelle conservent leur historique','de':'Kein lokales Protokoll: Nur über dieses Gateway erstellte Unterhaltungen behalten ihren Verlauf','pt-BR':'Sem transcrição local: apenas conversas criadas por este gateway mantêm o histórico','ru':'Нет локальной записи: история сохраняется только для разговоров, созданных через этот шлюз','ar':'لا يوجد سجل محلي: تحتفظ المحادثات التي أُنشئت عبر هذه البوابة فقط بسجلها'},
   'No proxies; requests will connect directly': {'zh-CN':'暂无代理，请求将直连','zh-TW':'暫無代理，要求將直連','ja':'プロキシなし。リクエストは直接接続されます','ko':'프록시 없음. 요청은 직접 연결됩니다','es':'Sin proxies; las solicitudes se conectarán directamente','fr':'Aucun proxy ; les requêtes se connecteront directement','de':'Keine Proxys; Anfragen werden direkt verbunden','pt-BR':'Sem proxies; solicitações se conectarão diretamente','ru':'Нет прокси; запросы будут подключаться напрямую','ar':'لا توجد بروكسيات؛ ستتصل الطلبات مباشرة'},
   'No models available': {'zh-CN':'暂无可用模型','zh-TW':'暫無可用模型','ja':'利用可能なモデルはありません','ko':'사용 가능한 모델 없음','es':'No hay modelos disponibles','fr':'Aucun modèle disponible','de':'Keine Modelle verfügbar','pt-BR':'Nenhum modelo disponível','ru':'Нет доступных моделей','ar':'لا توجد نماذج متاحة'},
   'Not tested': {'zh-CN':'未测试','zh-TW':'未測試','ja':'未テスト','ko':'미테스트','es':'Sin probar','fr':'Non testé','de':'Nicht getestet','pt-BR':'Não testado','ru':'Не протестирован','ar':'لم يتم اختباره'},
@@ -1718,18 +1720,23 @@ async function loadConversations(){
     $('convRows').innerHTML=c.length?c.map(x=>{
       const id=String(x.conversationId||'');
       const updated=x.updateTimeUtc||x.createTimeUtc;
-      return `<tr class="conv-row" data-conversation-id="${esc(id)}">
-        <td><button class="conv-link" type="button">${esc(x.chatName||'未命名对话')}</button><div class="conv-meta"><code>${esc(id)}</code></div></td>
+      const hasHistory=x.historyAvailable===true;
+      const hint='No local transcript: only conversations created through this gateway keep their history';
+      const name=hasHistory?`<button class="conv-link" type="button">${esc(x.chatName||'未命名对话')}</button>`:`<span class="conv-link" style="cursor:default" title="${esc(hint)}">${esc(x.chatName||'未命名对话')}</span>`;
+      const view=hasHistory?`<button class="btn-sm btn" data-conv-action="view">View</button>`:`<button class="btn-sm btn" disabled title="${esc(hint)}">View</button>`;
+      return `<tr class="conv-row" data-conversation-id="${esc(id)}" data-history="${hasHistory?'1':'0'}">
+        <td>${name}<div class="conv-meta"><code>${esc(id)}</code>${hasHistory?'':' · <span>Cloud only</span>'}</div></td>
         <td>${Number(x.messageCount||0)}</td>
         <td>${esc(x.accountEmail||x.accountId||'-')}</td>
         <td style="font-size:12px;color:var(--muted)">${updated?new Date(updated).toLocaleString():'-'}</td>
-        <td><div style="display:flex;gap:6px"><button class="btn-sm btn" data-conv-action="view">View</button><button class="btn-sm btn danger" data-conv-action="delete">Delete</button></div></td>
+        <td><div style="display:flex;gap:6px">${view}<button class="btn-sm btn danger" data-conv-action="delete">Delete</button></div></td>
       </tr>`;
     }).join(''):`<tr><td colspan="5" class="empty">${translateText('No conversations')}</td></tr>`;
     $('convRows').querySelectorAll('.conv-row').forEach(row=>{
       row.addEventListener('click',event=>{
         const action=event.target.closest('[data-conv-action]')?.dataset.convAction;
         if(action==='delete'){event.stopPropagation();deleteConv(row.dataset.conversationId);return;}
+        if(row.dataset.history!=='1'){showNotice(translateText('No local transcript: only conversations created through this gateway keep their history'),'error');return;}
         openConversation(row.dataset.conversationId);
       });
     });

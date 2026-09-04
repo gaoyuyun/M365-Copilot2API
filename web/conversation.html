@@ -168,8 +168,11 @@ function render(data){
   $('loading').hidden=true;
   $('error').hidden=true;
   setView(state.view);
-  lucide.createIcons();
+  refreshIcons();
 }
+// The icon font is loaded from a CDN that is not reachable from every network.
+// Never let a missing icon library block the transcript itself.
+function refreshIcons(){try{if(window.lucide)lucide.createIcons();}catch(_){}}
 async function loadConversation(){
   const id=new URLSearchParams(location.search).get('id');
   if(!id){showError('缺少会话 ID');return;}
@@ -186,8 +189,8 @@ function showError(message){$('loading').hidden=true;$('conversationView').hidde
 function setView(view){state.view=view==='json'?'json':'conversation';$('conversationTab').classList.toggle('active',state.view==='conversation');$('jsonTab').classList.toggle('active',state.view==='json');if(state.data){$('conversationView').hidden=state.view!=='conversation';$('jsonView').hidden=state.view!=='json';}}
 async function copyJSON(){if(!state.data)return;try{await navigator.clipboard.writeText(JSON.stringify(state.data,null,2));}catch(_){}}
 function goBack(){if(history.length>1)history.back();else location.href='/?page=conversations';}
-lucide.createIcons();
 loadConversation();
+refreshIcons();
 </script>
 </body>
 </html>

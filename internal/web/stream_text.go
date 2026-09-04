@@ -94,3 +94,23 @@ func streamEmitText(ev chathub.StreamEvent, text, pending *strings.Builder, emit
 	pending.WriteString(v)
 	return nil
 }
+
+// flushStreamText delivers the tail retained by streamEmitText and then drains
+// the public-identity filter. Callers must invoke it only after deciding that
+// the buffered text is not a tool call: tool-candidate fences intentionally
+// remain withheld until that decision has been made.
+func flushStreamText(pending *strings.Builder, identityFilter *publicIdentityStreamFilter, emitFiltered, emitRaw func(string) error) error {
+	if pending != nil && pending.Len() > 0 {
+		tail := pending.String()
+		pending.Reset()
+		if err := emitFiltered(tail); err != nil {
+			return err
+		}
+	}
+	if identityFilter != nil {
+		if tail := identityFilter.Flush(); tail != "" {
+			return emitRaw(tail)
+		}
+	}
+	return nil
+}

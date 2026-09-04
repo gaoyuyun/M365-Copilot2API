@@ -7,14 +7,16 @@ import (
 	"unicode/utf8"
 )
 
-func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, sendUsage bool, calls []detectedToolCall, res chathub.Result) error {
-	toolCalls := toolCallMaps(calls)
-	msg := map[string]any{"role": "assistant", "content": nil, "tool_calls": toolCalls}
-	if res.Reasoning != "" {
-		if reasoning := sanitizePublicReasoningText(res.Reasoning); reasoning != "" {
-			msg["reasoning_content"] = reasoning
-		}
+func toolResponseMessage(calls []detectedToolCall, res chathub.Result) oaiMsg {
+	msg := oaiMsg{Role: "assistant", ReasoningContent: sanitizePublicReasoningText(res.Reasoning)}
+	for _, call := range toolCallMaps(calls) {
+		msg.ToolCalls = append(msg.ToolCalls, call.(map[string]any))
 	}
+	return msg
+}
+
+func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, sendUsage bool, calls []detectedToolCall, res chathub.Result) error {
+	msg := toolResponseMessage(calls, res)
 	pt := EstimateTokens(res.Text)
 	for _, tc := range calls {
 		pt += EstimateTokens(string(tc.Arguments))

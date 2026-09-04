@@ -162,7 +162,15 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 		writeOpenAIError(w, http.StatusBadGateway, "m365_error", err.Error())
 		return
 	}
+	// ListSessions is newest-first. Keep only the newest local binding for a
+	// cloud conversation so the row agrees with GetConversationForAdmin when
+	// multiple API-key tenants have bindings for the same conversation id.
+	seenLocal := make(map[string]bool)
 	for _, session := range s.sessionResolver.ListSessions() {
+		if seenLocal[session.ConversationID] {
+			continue
+		}
+		seenLocal[session.ConversationID] = true
 		row, ok := rows[session.ConversationID]
 		if !ok {
 			row = map[string]any{}
@@ -186,6 +194,13 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 
 	data := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
+		if _, ok := row["source"]; !ok {
+			// The conversation exists only upstream: the cloud list exposes
+			// titles and timestamps, not messages, so no transcript can be
+			// shown for it. Say so explicitly instead of leaving the fields out.
+			row["source"] = "cloud"
+			row["historyAvailable"] = false
+		}
 		data = append(data, row)
 	}
 	sort.Slice(data, func(i, j int) bool {
@@ -208,7 +223,10 @@ func (s *Server) handleM365ConversationDetail(w http.ResponseWriter, r *http.Req
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "conversation id is required")
 		return
 	}
-	session, found := s.sessionResolver.GetConversation(tenantFromRequest(r), conversationID)
+	// This route is administrator-only. The browser authenticates with the
+	// admin session cookie rather than the API key that owns the conversation,
+	// so a tenant-scoped lookup would always miss keyed sessions.
+	session, found := s.sessionResolver.GetConversationForAdmin(conversationID)
 	if !found {
 		writeOpenAIError(w, http.StatusNotFound, "conversation_not_found", "conversation history is not available")
 		return

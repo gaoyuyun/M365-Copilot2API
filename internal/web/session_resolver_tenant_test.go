@@ -64,7 +64,7 @@ func TestExplicitSessionIDIsolatedByTenant(t *testing.T) {
 	resolve := func(key string) ResolveResult {
 		r := tenantReq(key, "203.0.113.9", "ua")
 		r.Header.Set("X-M365-Session-Id", "shared-id")
-		return sr.Resolve(r, &oaiReq{Messages: []oaiMsg{{Role: "user", Content: "hi " + key}}})
+		return sr.Resolve(r, &oaiReq{Messages: []oaiMsg{{Role: "user", Content: "hi " + key}, {Role: "user", Content: "continue"}}})
 	}
 
 	bind("alice", "conv-alice")

@@ -21,4 +21,13 @@ func TestContentPolicyBlock(t *testing.T) {
 	if !chathub.IsContentPolicyBlock("很抱歉，我无法生成该图像") {
 		t.Fatal("chathub.IsContentPolicyBlock did not detect refusal")
 	}
+	for _, refusal := range []string{
+		"Sorry, it looks like I can’t respond to this. Let’s try a different topic.",
+		"Sorry, it looks like I can't chat about this. Let's try a different topic.",
+		"Hmm...it looks like I can't chat about this. Let's try a different topic.",
+	} {
+		if !chathub.IsContentPolicyBlock(refusal) {
+			t.Fatalf("observed M365 refusal was not detected: %q", refusal)
+		}
+	}
 }
